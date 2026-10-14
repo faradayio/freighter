@@ -55,7 +55,7 @@ fn source_record_refuses_inconsistent_cuts_and_unmeasured_sizes() {
     let mut doc: serde_json::Value = serde_json::from_str(SOURCE_FIXTURE).unwrap();
     doc["rows"] = serde_json::json!(0);
     let err = SourceRecord::from_json(&doc.to_string()).unwrap_err();
-    assert!(err.to_string().contains("rows"), "{err}");
+    assert!(err.to_string().contains("rows must be positive"), "{err}");
 
     let cases = [
         (

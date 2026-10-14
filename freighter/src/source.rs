@@ -164,7 +164,7 @@ impl SourceRecord {
                 s.max_rows_per_bucket, s.rows
             )));
         }
-        if s.max_rows_per_bucket * u64::from(s.buckets) < s.rows {
+        if s.max_rows_per_bucket.saturating_mul(u64::from(s.buckets)) < s.rows {
             return Err(Error::Source(format!(
                 "max_rows_per_bucket {} × {} buckets cannot hold {} rows",
                 s.max_rows_per_bucket, s.buckets, s.rows

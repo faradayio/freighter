@@ -1,12 +1,24 @@
-//! freighter <manifest-uri>
+//! freighter prepare | plan | move | verify | validate
 //!
-//! Fetches the MoveManifest JSON from the URI (gs:// or file://), runs the
-//! move, exits non-zero on error. Everything else is the library's job.
+//! Parses the command line (`cli.rs`), installs the TLS provider and the
+//! logger, and dispatches into the library. Everything else is the
+//! library's job. Exit codes: 0 ok; 1 it broke; 2 the user must fix
+//! something (a refused manifest, a table that exists, a bad flag).
 
+use std::io::Read;
+use std::path::Path as FsPath;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
+
+mod cli;
+
+use freighter::bqjobs::BqJobs;
+use freighter::error::Error;
+use freighter::manifest::MoveManifest;
+use freighter::source::SourceRecord;
 
 /// Binary-only allocator swap (see Cargo.toml note on `mimalloc`).
 #[global_allocator]
@@ -58,61 +70,220 @@ fn store_for(uri: &str) -> Result<(Arc<dyn ObjectStore>, Path), String> {
     }
 }
 
-fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    // object_store's reqwest is built without a crypto provider (Cargo.toml),
-    // so rustls needs a process default before the first GCS request.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let uri = match std::env::args().nth(1) {
-        Some(u) => u,
+/// 2 for what the user fixes, 1 for what broke. `verify` overrides this:
+/// any error there is "the check could not run", 2.
+fn exit_code(e: &Error) -> i32 {
+    match e {
+        Error::Refused(_) | Error::Manifest(_) | Error::Source(_) => 2,
+        _ => 1,
+    }
+}
+
+/// The manifest document from a URI, through the store rooted at its
+/// directory (verdicts land and are read there).
+async fn fetch_manifest(uri: &str) -> Result<(Arc<dyn ObjectStore>, MoveManifest), (i32, String)> {
+    let (store, name) = store_for(uri).map_err(|e| (2, e))?;
+    let doc = store
+        .get(&name)
+        .await
+        .map_err(|e| (2, format!("fetch manifest {uri}: {e}")))?
+        .bytes()
+        .await
+        .map_err(|e| (2, format!("read manifest {uri}: {e}")))?;
+    let text = std::str::from_utf8(&doc).map_err(|e| (2, e.to_string()))?;
+    let manifest = MoveManifest::from_json(text).map_err(|e| (2, e.to_string()))?;
+    Ok((store, manifest))
+}
+
+/// `validate`'s document: stdin or a local file. No network, so gs:// is
+/// refused with the usage line.
+fn read_local(manifest: &str) -> Result<String, String> {
+    if manifest == "-" {
+        let mut s = String::new();
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .map_err(|e| format!("read stdin: {e}"))?;
+        return Ok(s);
+    }
+    let Some(path) = manifest.strip_prefix("file://") else {
+        return Err(format!(
+            "validate reads file:// or - (stdin), got {manifest:?}"
+        ));
+    };
+    std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))
+}
+
+fn write_out(out: Option<&FsPath>, text: &str) -> Result<(), String> {
+    match out {
+        Some(path) => {
+            std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+        }
         None => {
-            eprintln!("usage: freighter <manifest-uri>");
-            std::process::exit(2);
+            println!("{text}");
+            Ok(())
+        }
+    }
+}
+
+async fn run_prepare(args: cli::PrepareArgs) -> i32 {
+    let out = args.out.clone();
+    let cfg = match args.into_config() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("{e}");
+            return exit_code(&e);
         }
     };
+    let jobs = match BqJobs::connect().await {
+        Ok(j) => j,
+        Err(e) => {
+            log::error!("{e}");
+            return 1;
+        }
+    };
+    let record = match freighter::prepare::run(&jobs, &cfg).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("{e}");
+            return exit_code(&e);
+        }
+    };
+    match record
+        .to_json()
+        .map_err(|e| e.to_string())
+        .and_then(|t| write_out(out.as_deref(), &t))
+    {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("{e}");
+            1
+        }
+    }
+}
+
+fn run_plan(args: cli::PlanArgs) -> i32 {
+    let source_path = args.source.clone();
+    let out_dir = args.out_dir.clone();
+    let cfg = args.into_config(SystemTime::now());
+    let source = match std::fs::read_to_string(&source_path)
+        .map_err(|e| Error::Refused(format!("read {}: {e}", source_path.display())))
+        .and_then(|t| SourceRecord::from_json(&t))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("{e}");
+            return exit_code(&e);
+        }
+    };
+    match freighter::plan::plan(&source, &cfg)
+        .and_then(|manifests| freighter::plan::write_manifests(&out_dir, &manifests))
+    {
+        Ok(paths) => {
+            for p in paths {
+                log::info!("wrote {}", p.display());
+            }
+            0
+        }
+        Err(e) => {
+            log::error!("{e}");
+            exit_code(&e)
+        }
+    }
+}
+
+async fn run_move(manifest_uri: &str) -> i32 {
+    let (store, manifest) = match fetch_manifest(manifest_uri).await {
+        Ok(x) => x,
+        Err((code, e)) => {
+            log::error!("{e}");
+            return code;
+        }
+    };
+    match freighter::pipeline::run_move(manifest, store).await {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("move failed: {e}");
+            1
+        }
+    }
+}
+
+async fn run_verify(args: cli::VerifyArgs) -> i32 {
+    let (store, manifest) = match fetch_manifest(&args.manifest_uri).await {
+        Ok(x) => x,
+        Err((code, e)) => {
+            log::error!("{e}");
+            return code;
+        }
+    };
+    let billing_project = args
+        .billing_project
+        .unwrap_or_else(|| manifest.billing_project.clone());
+    let report = match BqJobs::connect().await {
+        Ok(jobs) => freighter::verify::run(&manifest, store, &jobs, &billing_project).await,
+        Err(e) => Err(e),
+    };
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("verify could not run: {e}");
+            return 2;
+        }
+    };
+    let text = match serde_json::to_string_pretty(&report) {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("report json: {e}");
+            return 2;
+        }
+    };
+    if let Err(e) = write_out(args.out.as_deref(), &text) {
+        log::error!("{e}");
+        return 2;
+    }
+    if report.ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn run_validate(manifest: &str) -> i32 {
+    let doc = match read_local(manifest) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    match MoveManifest::from_json(&doc) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    }
+}
+
+fn main() {
+    let command = cli::parse();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // reqwest (object_store's and bqjobs') is built without a crypto
+    // provider (Cargo.toml), so rustls needs a process default before the
+    // first HTTPS request.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
         .enable_all()
         .build()
         .expect("tokio runtime");
     let code = rt.block_on(async {
-        let (store, name) = match store_for(&uri) {
-            Ok(x) => x,
-            Err(e) => {
-                log::error!("{e}");
-                return 2;
-            }
-        };
-        let doc = match store.get(&name).await {
-            Ok(r) => match r.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    log::error!("read manifest {uri}: {e}");
-                    return 2;
-                }
-            },
-            Err(e) => {
-                log::error!("fetch manifest {uri}: {e}");
-                return 2;
-            }
-        };
-        let manifest = match std::str::from_utf8(&doc)
-            .map_err(|e| e.to_string())
-            .and_then(|s| {
-                freighter::manifest::MoveManifest::from_json(s).map_err(|e| e.to_string())
-            }) {
-            Ok(m) => m,
-            Err(e) => {
-                log::error!("{e}");
-                return 2;
-            }
-        };
-        match freighter::pipeline::run_move(manifest, store).await {
-            Ok(()) => 0,
-            Err(e) => {
-                log::error!("move failed: {e}");
-                1
-            }
+        match command {
+            cli::Command::Prepare(args) => run_prepare(args).await,
+            cli::Command::Plan(args) => run_plan(args),
+            cli::Command::Move { manifest_uri } => run_move(&manifest_uri).await,
+            cli::Command::Verify(args) => run_verify(args).await,
+            cli::Command::Validate { manifest } => run_validate(&manifest),
         }
     });
     std::process::exit(code);

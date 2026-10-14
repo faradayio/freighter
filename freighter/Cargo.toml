@@ -1,0 +1,84 @@
+[package]
+name = "bq-freighter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version = "1.88"
+description = "Bulk-load a BigQuery table into Bigtable in key order, with per-shard verdicts you can verify"
+repository = "https://github.com/faradayio/freighter"
+readme = "../README.md"
+keywords = ["bigquery", "bigtable", "gcp", "etl", "loader"]
+categories = ["command-line-utilities", "database"]
+
+[lib]
+name = "freighter"
+
+[[bin]]
+name = "freighter"
+path = "src/main.rs"
+
+[dependencies]
+# Bigtable client, named only by src/client.rs (the swap boundary). Chosen
+# over gcloud-sdk / google-cloud-rust after an emulator bake-off; see "Client
+# crate decision" in README.md. ring, not the default aws-lc: one TLS crypto
+# backend in the tree (gcp_auth and object_store's reqwest use ring too), and
+# no C/assembly build of aws-lc-sys.
+bigtable_rs = { version = "0.4.0", default-features = false, features = ["gcp-auth-ring", "tonic-tls-ring"] }
+# bigtable_rs does NOT re-export the generated protos, but its public API returns
+# and accepts them, so we depend on the proto crate directly: client.rs builds
+# mutations with it and the emulator suite builds RowFilters for read-back.
+# This version MUST stay in lockstep with whatever bigtable_rs depends on
+# (0.4.0 -> 0.39.x); a mismatch yields two incompatible copies of the same
+# prost types. Verify with `cargo tree -i` after any bump.
+googleapis-tonic-google-bigtable-v2 = "0.39.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+log = "0.4"
+# Timestamps only: RUST_LOG filters are plain level/target, no regex, and
+# pod logs have no terminal to colour.
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+# Only the Arrow crates the read path names. lz4: decompress the LZ4 Arrow
+# buffers BQ Storage Read sends.
+arrow-array = "56"
+arrow-buffer = "56"
+arrow-ipc = { version = "56", features = ["lz4"] }
+arrow-schema = "56"
+# Global allocator for the mover BINARY only (see main.rs): the pipeline
+# makes ~4 small allocations per cell across read_streams decode tasks plus
+# a deep clone per flush, and mimalloc beats glibc malloc on exactly that
+# multithreaded small-alloc profile. The library keeps the system allocator.
+mimalloc = "0.1"
+bytes = "1"
+# gzip for the `jsonz` cell value — the framing Java's GZIPOutputStream
+# writes. The default backend is pure Rust, so the build needs no C toolchain.
+flate2 = "1"
+# gcp-base + ring, not "gcp": that feature pulls aws-lc-rs as its crypto
+# backend, a second TLS stack with a C build.
+object_store = { version = "0.14", features = ["gcp-base", "ring"] }
+# BigQuery Storage Read. Version line differs from bigtable-v2 (0.34 vs
+# 0.39) but both resolve tonic ^0.14 / prost ^0.14 — ONE tonic in the tree.
+# Verify with `cargo tree -d` after any bump.
+googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.34"
+tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-ring"] }
+gcp_auth = "0.12"
+
+[dev-dependencies]
+# `test-util` unlocks `#[tokio::test(start_paused = true)]` + manual clock
+# advance, so the retry/backoff and write-deadline tests never genuinely
+# sleep. Dev-only: Cargo unions features per-dependency across a build, so
+# this does not leak `test-util` into the production binary.
+tokio = { version = "1", features = ["test-util"] }
+
+# The emulator suite needs a live cbtemulator and HARD FAILS without
+# BIGTABLE_EMULATOR_HOST (never skips). `test = false` keeps it out of a
+# bare `cargo test`; run it explicitly with `scripts/test-emulator.sh`.
+[[test]]
+name = "emulator"
+path = "tests/emulator/main.rs"
+test = false
+
+[lints]
+workspace = true

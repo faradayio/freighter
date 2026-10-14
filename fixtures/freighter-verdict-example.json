@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "shard_index": 0,
+  "rows_read": 6245162,
+  "cells_encoded": 6245100,
+  "cells_acknowledged": 6245100,
+  "cells_failed": 0,
+  "row_deletes_acknowledged": 62,
+  "row_deletes_failed": 0,
+  "entry_retries": 3,
+  "entries": 124903,
+  "requests": 2498,
+  "read_reopens": 1,
+  "rpc_retries": 2,
+  "read_seconds": 41.2,
+  "sort_seconds": 3.1,
+  "write_seconds": 760.0,
+  "stalled_seconds": 90.0,
+  "wall_seconds": 812.4,
+  "latency_ms_p50": 141.0,
+  "latency_ms_p99": 512.0,
+  "outcome": "complete"
+}

@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "source_table": "projects/example-project/datasets/freighter/tables/source",
+  "billing_project": "example-project",
+  "rowkey_column": "key",
+  "range_column": "bucket",
+  "family": "data",
+  "bt_project": "example-project",
+  "bt_instance": "example-instance",
+  "destination_table": "example_table",
+  "app_profile": "bulk-write",
+  "shards": [
+    {
+      "index": 0,
+      "range": {
+        "kind": "int",
+        "lo": 0,
+        "hi": 53
+      },
+      "expect_empty": false,
+      "lane": 0
+    },
+    {
+      "index": 1,
+      "range": {
+        "kind": "int",
+        "lo": 54,
+        "hi": 107
+      },
+      "expect_empty": false,
+      "lane": 1
+    }
+  ],
+  "read_streams": 4,
+  "flush_cells": 8000,
+  "inflight_mutations": 64000,
+  "cell_timestamp_micros": 1789776000123000,
+  "null_json_deletes_row": false,
+  "rung": 4000
+}

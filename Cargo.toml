@@ -1,0 +1,17 @@
+[workspace]
+members = ["freighter"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+
+# The mover decodes and encodes millions of cells per second; thin LTO plus
+# single-unit codegen buys mid-single-digit percent on those hot loops for
+# nothing but release build time.
+[profile.release]
+lto = "thin"
+codegen-units = 1

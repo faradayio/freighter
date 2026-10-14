@@ -1,0 +1,39 @@
+# One freighter load as a Kubernetes Job on GKE.
+#
+# Credentials: GKE Workload Identity. Bind the Kubernetes service account to a
+# Google service account with roles/bigquery.readSessionUser (billing project),
+# roles/bigquery.dataViewer (source table), roles/bigtable.user (instance) and
+# object read + create on the manifest's GCS prefix. freighter finds the
+# credentials through the standard ADC chain; no key file is needed.
+#
+# Size memory from docs/sizing.md. requests == limits pins the pod to whole
+# CPUs; freighter sizes its thread pool to the CPUs it sees.
+#
+# backoffLimit: 0 because a retry belongs to whoever reads the verdicts: re-run
+# only the shards without a clean verdict, with the same cell timestamp, under
+# a new prefix (docs/verifying-a-load.md). A kubelet retry would re-run every
+# shard and overwrite the first attempt's verdicts.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: freighter-load
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 28800
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: freighter # bound to a Google service account
+      containers:
+        - name: freighter
+          image: ghcr.io/faradayio/freighter:v0.1.0
+          args: ["gs://my-bucket/loads/2026-10-14/manifest.json"]
+          env:
+            - { name: RUST_LOG, value: info }
+          resources:
+            requests: { cpu: "8", memory: 24Gi }
+            limits: { cpu: "8", memory: 24Gi }

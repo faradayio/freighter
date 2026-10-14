@@ -112,9 +112,10 @@ get two incompatible copies of the same prost types. `cargo tree -i
 googleapis-tonic-google-bigtable-v2` currently shows a single shared v0.39.0,
 and should be re-checked after any bump.
 
-### Toolchain floor
+### Minimum supported Rust
 
-This dependency tree sets the toolchain floor at **1.88**.
+This dependency tree sets the oldest supported compiler at **1.88**
+(`rust-version`); releases are built with a newer pinned compiler.
 `bigtable_rs` requires `tonic ^0.14.2`, and tonic 0.14.x declares
 `rust-version = 1.88`. This is **not** a consequence of the choice: `gcloud-sdk`
 resolves to the same tonic/hyper/icu tree and fails on 1.84 with an identical

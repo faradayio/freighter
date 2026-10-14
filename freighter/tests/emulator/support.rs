@@ -126,9 +126,18 @@ impl freighter::write::WriteRows for FlakyWriter {
         let inner = self.inner.clone();
         let table = table.to_owned();
         async move {
-            let took_a_failure = remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok();
+            // A compare-exchange loop rather than fetch_update (deprecated on
+            // current stable) or try_update (newer than rust-version).
+            let mut n = remaining.load(Ordering::SeqCst);
+            let took_a_failure = loop {
+                if n == 0 {
+                    break false;
+                }
+                match remaining.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break true,
+                    Err(current) => n = current,
+                }
+            };
             if took_a_failure {
                 return Err(freighter::error::Error::BigtableRpc {
                     code,

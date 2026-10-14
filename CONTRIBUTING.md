@@ -6,8 +6,12 @@
 cargo build --release   # target/release/freighter
 ```
 
-The toolchain is pinned in `rust-toolchain.toml` (1.88, the floor set by the
-Bigtable client's dependency tree; see [docs/design.md](docs/design.md)).
+Releases are built with the compiler pinned in `rust-toolchain.toml`. The
+oldest supported compiler is 1.88 (`rust-version` in `freighter/Cargo.toml`,
+the floor set by the Bigtable client's dependency tree; see
+[docs/design.md](docs/design.md)). Clippy's `incompatible_msrv` lint refuses
+newer standard-library APIs anywhere in the crate, tests included, and a CI job
+builds with 1.88.
 
 ## Testing
 

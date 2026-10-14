@@ -1,8 +1,5 @@
-# 1.88 is a floor imposed by the Bigtable client dependency tree, not a preference:
-# bigtable_rs 0.4.0 requires tonic ^0.14.2, and tonic 0.14.x declares rust-version
-# 1.88. The same floor applies to every alternative evaluated in the client-crate
-# bake-off (gcloud-sdk 0.30.2 pulls the identical tonic/hyper/icu tree), so it is
-# not avoidable by picking a different client. See docs/design.md "Choosing the Bigtable client".
+# The compiler releases are built with. Bumped deliberately; the oldest
+# supported compiler is `rust-version` in freighter/Cargo.toml, checked by CI.
 [toolchain]
-channel = "1.88"
+channel = "1.99"
 components = ["rustfmt", "clippy"]

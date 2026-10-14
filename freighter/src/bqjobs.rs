@@ -84,7 +84,7 @@ impl Row {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub schema: Vec<Field>,
     pub rows: Vec<Row>,
@@ -118,7 +118,7 @@ pub struct JobRef {
 
 /// One decoded response page of `jobs.query` / `getQueryResults`.
 #[derive(Debug)]
-pub struct Page {
+pub(crate) struct Page {
     pub job_complete: bool,
     pub job: Option<JobRef>,
     pub schema: Vec<Field>,
@@ -256,7 +256,7 @@ fn fields(schema: Option<WireSchema>) -> Vec<Field> {
         .unwrap_or_default()
 }
 
-pub fn decode_query_page(body: &[u8]) -> Result<Page> {
+pub(crate) fn decode_query_page(body: &[u8]) -> Result<Page> {
     let w: WireQueryResponse =
         serde_json::from_slice(body).map_err(|e| Error::BqJob(format!("query response: {e}")))?;
     let rows = w
@@ -283,7 +283,7 @@ pub fn decode_query_page(body: &[u8]) -> Result<Page> {
     })
 }
 
-pub fn decode_table(body: &[u8]) -> Result<TableInfo> {
+pub(crate) fn decode_table(body: &[u8]) -> Result<TableInfo> {
     let w: WireTable =
         serde_json::from_slice(body).map_err(|e| Error::BqJob(format!("table: {e}")))?;
     let range_partitioning = w
@@ -313,26 +313,27 @@ pub fn decode_table(body: &[u8]) -> Result<TableInfo> {
 
 /// A failed call, before retry policy is applied.
 #[derive(Debug)]
-pub enum CallError {
+pub(crate) enum CallError {
     Transport(reqwest::Error),
     Status {
         code: u16,
         reason: Option<String>,
         message: String,
     },
-    /// A token mint or a decode failure: not the server's fault, never retried.
-    Fatal(Error),
+    /// The ADC token could not be minted; a metadata-server blip, retried like a wire failure — bqread.rs does the same.
+    Token(String),
 }
 
 impl CallError {
-    pub fn is_retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         match self {
-            CallError::Transport(e) => e.is_connect() || e.is_timeout(),
+            // Every call is idempotent (GETs; the POST via requestId), so any wire failure is safe to retry.
+            CallError::Transport(e) => !e.is_builder() && !e.is_redirect(),
             CallError::Status { code, reason, .. } => retryable_http(*code, reason.as_deref()),
-            CallError::Fatal(_) => false,
+            CallError::Token(_) => true,
         }
     }
-    pub fn status(&self) -> Option<u16> {
+    pub(crate) fn status(&self) -> Option<u16> {
         match self {
             CallError::Status { code, .. } => Some(*code),
             _ => None,
@@ -356,14 +357,14 @@ impl std::fmt::Display for CallError {
                 reason: None,
                 message,
             } => write!(f, "{code}: {message}"),
-            CallError::Fatal(e) => write!(f, "{e}"),
+            CallError::Token(m) => write!(f, "gcp token: {m}"),
         }
     }
 }
 
 /// `error.{message, errors[0].reason}` from an error body; a non-JSON body
 /// (a proxy's HTML) keeps the status and the first 200 bytes.
-pub fn error_from_body(status: u16, body: &[u8]) -> CallError {
+pub(crate) fn error_from_body(status: u16, body: &[u8]) -> CallError {
     match serde_json::from_slice::<WireErrorBody>(body) {
         Ok(b) => CallError::Status {
             code: status,
@@ -381,7 +382,7 @@ pub fn error_from_body(status: u16, body: &[u8]) -> CallError {
 impl From<CallError> for Error {
     fn from(e: CallError) -> Self {
         match e {
-            CallError::Fatal(inner) => inner,
+            CallError::Token(m) => Error::BqJob(format!("gcp token: {m}")),
             other => Error::BqJob(other.to_string()),
         }
     }
@@ -393,13 +394,22 @@ enum Call<'a> {
         url: reqwest::Url,
     },
     Post {
-        url: String,
+        url: reqwest::Url,
         body: &'a [u8],
     },
 }
 
-fn url_with(url: &str, query: &[(&str, &str)]) -> Result<reqwest::Url> {
-    reqwest::Url::parse_with_params(url, query).map_err(|e| Error::BqJob(format!("url {url}: {e}")))
+/// An endpoint under BASE: path segments are pushed (and so percent-encoded)
+/// one by one, and the query string is added only when there is one.
+fn endpoint(segments: &[&str], query: &[(&str, &str)]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(BASE).map_err(|e| Error::BqJob(format!("base url: {e}")))?;
+    url.path_segments_mut()
+        .map_err(|_| Error::BqJob("base url cannot be a base".to_owned()))?
+        .extend(segments);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query);
+    }
+    Ok(url)
 }
 
 /// The jobs client: one HTTP client and the ADC token provider (the same
@@ -422,7 +432,7 @@ impl BqJobs {
         Ok(Self { http, provider })
     }
 
-    /// One HTTP call with a fresh bearer token, retried per `retry.rs` on
+    /// One HTTP call with the current bearer token (gcp_auth caches and refreshes it), retried per `retry.rs` on
     /// transport errors and retryable statuses. Returns the response body.
     async fn call(
         &self,
@@ -435,12 +445,12 @@ impl BqJobs {
                 .provider
                 .token(&[SCOPE])
                 .await
-                .map_err(|e| CallError::Fatal(Error::BqJob(format!("gcp token: {e}"))))?;
+                .map_err(|e| CallError::Token(e.to_string()))?;
             let req = match call {
                 Call::Get { url } => self.http.get(url.clone()),
                 Call::Post { url, body } => self
                     .http
-                    .post(url.as_str())
+                    .post(url.clone())
                     .header("content-type", "application/json")
                     .body(body.to_vec()),
             };
@@ -464,7 +474,7 @@ impl BqJobs {
     /// Runs one statement to completion and returns its whole result,
     /// following pages. The `requestId` is minted once, outside the retry
     /// loop, so a re-sent POST dedupes against the job the server already
-    /// started (BigQuery's 15-minute window) instead of starting a second one.
+    /// started instead of starting a second one.
     pub async fn query(&self, billing_project: &str, sql: &str) -> Result<QueryResult> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let label = format!("bq request_id={request_id}");
@@ -475,7 +485,7 @@ impl BqJobs {
             "requestId": request_id,
         }))
         .map_err(|e| Error::BqJob(format!("request body: {e}")))?;
-        let url = format!("{BASE}/projects/{billing_project}/jobs/query");
+        let url = endpoint(&["projects", billing_project, "jobs", "query"], &[])?;
         let first = self
             .call("jobs.query", &label, &Call::Post { url, body: &body })
             .await?;
@@ -484,12 +494,12 @@ impl BqJobs {
         let mut rows = std::mem::take(&mut page.rows);
         let mut total_bytes_processed = page.total_bytes_processed;
         let mut token = page.page_token.take();
+        let mut polls: u32 = 0;
         while !page.job_complete || token.is_some() {
             let job = page
                 .job
                 .clone()
                 .ok_or_else(|| Error::BqJob("query response carries no jobReference".to_owned()))?;
-            let base = format!("{BASE}/projects/{}/queries/{}", job.project_id, job.job_id);
             let wait = WAIT_MS.to_string();
             let mut query: Vec<(&str, &str)> = vec![("timeoutMs", &wait)];
             if let Some(loc) = job.location.as_deref() {
@@ -498,19 +508,28 @@ impl BqJobs {
             if let Some(t) = token.as_deref() {
                 query.push(("pageToken", t));
             }
-            let url = url_with(&base, &query)?;
+            let url = endpoint(
+                &["projects", &job.project_id, "queries", &job.job_id],
+                &query,
+            )?;
             let bytes = self
                 .call("jobs.getQueryResults", &label, &Call::Get { url })
                 .await?;
             let mut next = decode_query_page(&bytes)?;
             if next.job.is_none() {
-                next.job = Some(job);
+                next.job = Some(job.clone());
             }
             if schema.is_empty() {
                 schema = std::mem::take(&mut next.schema);
             }
             rows.append(&mut next.rows);
             total_bytes_processed = next.total_bytes_processed.or(total_bytes_processed);
+            if !next.job_complete {
+                polls += 1;
+                if polls.is_multiple_of(6) {
+                    log::info!("bq job {} still running after {} polls", job.job_id, polls);
+                }
+            }
             token = next.page_token.take();
             page = next;
         }
@@ -523,11 +542,10 @@ impl BqJobs {
 
     /// `tables.get`; a 404 is `None`.
     pub async fn table(&self, t: &TableRef) -> Result<Option<TableInfo>> {
-        let url = url_with(
-            &format!(
-                "{BASE}/projects/{}/datasets/{}/tables/{}",
-                t.project, t.dataset, t.table
-            ),
+        let url = endpoint(
+            &[
+                "projects", &t.project, "datasets", &t.dataset, "tables", &t.table,
+            ],
             &[],
         )?;
         let label = format!("bq table={t}");
@@ -642,11 +660,40 @@ mod tests {
         let e = error_from_body(503, b"<html>bad gateway</html>");
         assert!(e.is_retryable());
         assert!(e.to_string().starts_with("503"));
+        let e = error_from_body(403, br#"{"error": {"code": 403, "message": "Access Denied", "errors": [{"reason": "accessDenied"}]}}"#);
+        assert!(
+            !e.is_retryable(),
+            "a 403 without rateLimitExceeded is not retried"
+        );
+        let e = error_from_body(429, br#"{"error": {"code": 429, "message": "Too many", "errors": [{"reason": "rateLimitExceeded"}]}}"#);
+        assert!(e.is_retryable());
+        let e = error_from_body(400, br#"{"error": {"code": 400, "message": "Job rate limit", "errors": [{"reason": "jobRateLimitExceeded"}]}}"#);
+        assert!(
+            !e.is_retryable(),
+            "job-level errors need a new job id, never a re-send"
+        );
     }
 
     #[test]
     fn a_200_with_a_warning_errors_array_is_not_a_failure() {
         let doc = r#"{"jobComplete": true, "errors": [{"reason": "warning", "message": "x"}], "rows": []}"#;
         assert!(decode_query_page(doc.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn endpoints_encode_segments_and_omit_an_empty_query() {
+        let u = endpoint(&["projects", "p", "datasets", "d", "tables", "t"], &[]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://bigquery.googleapis.com/bigquery/v2/projects/p/datasets/d/tables/t"
+        );
+        let u = endpoint(
+            &["projects", "p", "queries", "job_1"],
+            &[("timeoutMs", "10000"), ("location", "US")],
+        )
+        .unwrap();
+        assert_eq!(u.as_str(), "https://bigquery.googleapis.com/bigquery/v2/projects/p/queries/job_1?timeoutMs=10000&location=US");
+        let u = endpoint(&["projects", "a b/c"], &[]).unwrap();
+        assert!(u.as_str().ends_with("/projects/a%20b%2Fc"));
     }
 }

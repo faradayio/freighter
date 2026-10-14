@@ -185,7 +185,7 @@ milliseconds) is refused at the flag with exit 2; the mover applies the same
 rule to the manifest. Nothing is written:
 
 ```
-error: invalid value '1792003349' for '--cell-timestamp-micros <CELL_TIMESTAMP_MICROS>': cell timestamp 1792003349 is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20); seconds or milliseconds would stamp cells in 1970
+error: invalid value '1792003349' for '--cell-timestamp-micros <CELL_TIMESTAMP_MICROS>': cell_timestamp_micros 1792003349 is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20) — seconds or milliseconds stamp cells in 1970, where they lose to every existing cell; nanoseconds stamp them millennia ahead, where they beat every later load
 ```
 
 See [Operating a load](operating.md#re-running-failed-shards).

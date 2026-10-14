@@ -305,6 +305,16 @@ fn lookup_refuses_a_cell_timestamp_in_the_wrong_unit() {
     }
 }
 
+#[test]
+fn lookup_refuses_a_cell_timestamp_in_seconds_by_its_unit() {
+    // Not a whole number of milliseconds either; the unit is the useful
+    // message, as it is at plan's flag.
+    let mut doc: serde_json::Value = serde_json::from_str(LOOKUP_MANIFEST_FIXTURE).unwrap();
+    doc["cell_timestamp_micros"] = serde_json::json!(1_792_003_349i64);
+    let err = MoveManifest::from_json(&doc.to_string()).unwrap_err();
+    assert!(err.to_string().contains("microseconds"), "{err}");
+}
+
 /// The v4 fixture with `version` set to 3 and the two v4 fields removed:
 /// what every v3 author renders. Derived in-test so the two cannot drift.
 fn v3_document() -> String {

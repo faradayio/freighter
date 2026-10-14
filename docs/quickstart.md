@@ -76,7 +76,6 @@ cat source.json
   "table": "projects/my-project/datasets/my_dataset/tables/freighter_quickstart",
   "billing_project": "my-project",
   "rowkey_column": "key",
-  "json_column": "json",
   "range_column": "bucket",
   "boundaries": [
     "k/0050000"

@@ -8,9 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use freighter::error::{Error, Result};
-use freighter::manifest::{CellCompression, MAX_CELL_TIMESTAMP_MICROS, MIN_CELL_TIMESTAMP_MICROS};
+use freighter::manifest::{check_cell_timestamp, CellCompression, MAX_FLUSH_CELLS};
 use freighter::plan::ramp::Ramp;
-use freighter::plan::sizing::{parse_memory, SizingConfig, MAX_FLUSH_CELLS, POD_READ_STREAMS};
+use freighter::plan::sizing::{parse_memory, SizingConfig, POD_READ_STREAMS};
 use freighter::plan::{Destination, PlanConfig};
 use freighter::prepare::boundaries::MAX_BUCKETS;
 use freighter::prepare::PrepareConfig;
@@ -92,30 +92,17 @@ fn parse_ramp(s: &str) -> Result<Ramp> {
     s.parse()
 }
 
-/// The manifest's rules for the one cell timestamp, applied at the command
+/// The manifest's rule for the one cell timestamp, applied at the command
 /// line so a value in the wrong unit is the user's error (exit 2), not a
 /// refusal of the manifest `plan` rendered.
 fn parse_cell_timestamp(s: &str) -> Result<i64> {
     let ts: i64 = s
         .parse()
         .map_err(|_| Error::Refused(format!("cell timestamp {s:?} is not an integer")))?;
-    if ts <= 0 {
-        return Err(Error::Refused(format!(
-            "cell timestamp {ts} must be positive, in microseconds since the epoch"
-        )));
-    }
-    // The range comes before the whole-millisecond rule: seconds are rarely
-    // a multiple of 1000, and "not microseconds" is the useful message.
-    if !(MIN_CELL_TIMESTAMP_MICROS..=MAX_CELL_TIMESTAMP_MICROS).contains(&ts) {
-        return Err(Error::Refused(format!(
-            "cell timestamp {ts} is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20); seconds or milliseconds would stamp cells in 1970"
-        )));
-    }
-    if ts % 1000 != 0 {
-        return Err(Error::Refused(format!(
-            "cell timestamp {ts} must be a whole number of milliseconds, in microseconds since the epoch"
-        )));
-    }
+    check_cell_timestamp(ts).map_err(|e| match e {
+        Error::Manifest(m) => Error::Refused(m),
+        e => Error::Refused(e.to_string()),
+    })?;
     Ok(ts)
 }
 

@@ -135,7 +135,7 @@ mod tests {
                 memory_bytes: sizing::parse_memory(memory).unwrap(),
                 compression: CellCompression::Gzip,
                 target_request_bytes: 4_000_000,
-                max_flush_cells: sizing::MAX_FLUSH_CELLS,
+                max_flush_cells: crate::manifest::MAX_FLUSH_CELLS,
                 read_streams: sizing::POD_READ_STREAMS,
             },
             destination: Destination {

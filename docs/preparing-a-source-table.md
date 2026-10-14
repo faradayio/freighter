@@ -169,7 +169,6 @@ does not know and any field it does not recognize. An example lives at
   "table": "projects/example-project/datasets/freighter/tables/source",
   "billing_project": "example-project",
   "rowkey_column": "key",
-  "json_column": "json",
   "range_column": "bucket",
   "boundaries": ["k/0500000", "k/1000000"],
   "buckets": 3,
@@ -188,7 +187,6 @@ does not know and any field it does not recognize. An example lives at
 | `table` | string | `projects/<p>/datasets/<d>/tables/<t>`, the manifest's `source_table` form |
 | `billing_project` | string | project the queries were billed to; the manifest's `billing_project` |
 | `rowkey_column` | string | always `key` |
-| `json_column` | string | always `json`. Recorded for readers; the mover reads `json` by name |
 | `range_column` | string | always `bucket` |
 | `boundaries` | array of strings | the interior cut points, strictly ascending. Bucket *i* ≥ 1 starts at `boundaries[i-1]` |
 | `buckets` | integer | `boundaries` + 1 |

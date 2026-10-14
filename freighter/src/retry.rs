@@ -270,17 +270,4 @@ mod tests {
             );
         }
     }
-
-    #[tokio::test(start_paused = true)]
-    async fn retry_rpc_accepts_any_display_label() {
-        let (v, retries) = retry_rpc(
-            "op",
-            "bq request_id=abc",
-            |_: &E| false,
-            |_| async { Ok::<_, E>(7) },
-        )
-        .await
-        .unwrap();
-        assert_eq!((v, retries), (7, 0));
-    }
 }

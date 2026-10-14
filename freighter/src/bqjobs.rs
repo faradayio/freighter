@@ -112,7 +112,7 @@ pub struct TableInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobRef {
+pub(crate) struct JobRef {
     pub project_id: String,
     pub job_id: String,
     pub location: Option<String>,
@@ -392,7 +392,15 @@ pub(crate) fn error_from_body(status: u16, body: &[u8]) -> CallError {
 impl From<CallError> for Error {
     fn from(e: CallError) -> Self {
         match e {
-            CallError::Token(m) => Error::BqJob(format!("gcp token: {m}")),
+            CallError::Status {
+                code,
+                reason,
+                message,
+            } => Error::BqStatus {
+                code,
+                reason,
+                message,
+            },
             other => Error::BqJob(other.to_string()),
         }
     }
@@ -678,6 +686,14 @@ mod tests {
         assert_eq!(e.status(), Some(404));
         assert!(e.to_string().contains("notFound"));
         assert_eq!(e.reason(), Some("notFound"));
+        assert_eq!(
+            Error::from(e).to_string(),
+            "bq job: 404 notFound: Not found: Table p:d.t"
+        );
+        assert_eq!(
+            Error::from(error_from_body(502, b"bad gateway")).to_string(),
+            "bq job: 502: bad gateway"
+        );
         assert!(error_from_body(404, b"<html>Not Found</html>")
             .reason()
             .is_none());

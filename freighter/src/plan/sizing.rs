@@ -2,10 +2,9 @@
 //! measured bytes per row. Pure.
 
 use crate::error::{Error, Result};
-use crate::manifest::CellCompression;
+use crate::manifest::{CellCompression, MAX_FLUSH_CELLS};
 use crate::source::SourceRecord;
 
-pub use crate::manifest::MAX_FLUSH_CELLS;
 /// What a resident row costs the mover beyond its key and value: the
 /// RowWrite and CellWrite structs, five small heap allocations with
 /// allocator overhead and rounding, and up to ~96 B while the shard's row
@@ -174,7 +173,6 @@ mod tests {
             table: "projects/example-project/datasets/d/tables/source".into(),
             billing_project: "example-project".into(),
             rowkey_column: "key".into(),
-            json_column: "json".into(),
             range_column: "bucket".into(),
             boundaries: (1..buckets).map(|i| format!("k/{i:05}")).collect(),
             buckets,

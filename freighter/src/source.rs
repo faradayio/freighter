@@ -104,8 +104,6 @@ pub struct SourceRecord {
     pub table: String,
     pub billing_project: String,
     pub rowkey_column: String,
-    /// Recorded for readers; the mover's decoder reads `json` by name.
-    pub json_column: String,
     /// The INT64 bucket column the boundaries cut: order-preserving over the key, the manifest's `range_column`.
     pub range_column: String,
     /// Interior quantile cuts, ascending; bucket i >= 1 starts at boundaries[i-1].
@@ -192,10 +190,6 @@ impl SourceRecord {
 
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(|e| Error::Source(format!("render: {e}")))
-    }
-
-    pub fn table_ref(&self) -> Result<TableRef> {
-        TableRef::from_path(&self.table).map_err(|e| Error::Source(e.to_string()))
     }
 
     /// The one place the gzip-vs-raw sizing choice is made.

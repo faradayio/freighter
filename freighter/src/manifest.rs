@@ -291,6 +291,28 @@ pub(crate) fn validate_lanes(shards: &[ShardSpec]) -> Result<()> {
     Ok(())
 }
 
+/// The one rule for a cell timestamp, shared by the manifest validator and
+/// `plan`'s flag. The range comes before the whole-millisecond check: a value
+/// in seconds is rarely a multiple of 1000, and the unit is the useful message.
+pub fn check_cell_timestamp(ts: i64) -> Result<()> {
+    if ts <= 0 {
+        return Err(Error::Manifest(format!(
+            "cell_timestamp_micros {ts} must be positive"
+        )));
+    }
+    if !(MIN_CELL_TIMESTAMP_MICROS..=MAX_CELL_TIMESTAMP_MICROS).contains(&ts) {
+        return Err(Error::Manifest(format!(
+            "cell_timestamp_micros {ts} is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20) — seconds or milliseconds stamp cells in 1970, where they lose to every existing cell; nanoseconds stamp them millennia ahead, where they beat every later load"
+        )));
+    }
+    if ts % 1000 != 0 {
+        return Err(Error::Manifest(format!(
+            "cell_timestamp_micros {ts} must be a whole number of milliseconds — Bigtable stores millisecond granularity"
+        )));
+    }
+    Ok(())
+}
+
 impl MoveManifest {
     pub fn from_json(doc: &str) -> Result<Self> {
         let probe: VersionProbe =
@@ -333,17 +355,7 @@ impl MoveManifest {
                 "qualifier must be non-empty — it names the cell's column".to_owned(),
             ));
         }
-        let ts = m.cell_timestamp_micros;
-        if ts <= 0 || ts % 1000 != 0 {
-            return Err(Error::Manifest(format!(
-                "cell_timestamp_micros {ts} must be positive and a whole number of milliseconds — Bigtable stores millisecond granularity"
-            )));
-        }
-        if !(MIN_CELL_TIMESTAMP_MICROS..=MAX_CELL_TIMESTAMP_MICROS).contains(&ts) {
-            return Err(Error::Manifest(format!(
-                "cell_timestamp_micros {ts} is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20) — seconds or milliseconds stamp cells in 1970, where they lose to every existing cell; nanoseconds stamp them millennia ahead, where they beat every later load"
-            )));
-        }
+        check_cell_timestamp(m.cell_timestamp_micros)?;
         if m.read_streams <= 0 {
             return Err(Error::Manifest(format!(
                 "read_streams {} must be positive — pick the stream count explicitly",

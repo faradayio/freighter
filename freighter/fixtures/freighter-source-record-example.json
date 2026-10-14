@@ -3,7 +3,6 @@
   "table": "projects/example-project/datasets/freighter/tables/source",
   "billing_project": "example-project",
   "rowkey_column": "key",
-  "json_column": "json",
   "range_column": "bucket",
   "boundaries": ["k/0500000", "k/1000000"],
   "buckets": 3,

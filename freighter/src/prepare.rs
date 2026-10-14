@@ -12,7 +12,7 @@ use crate::manifest::CellCompression;
 use crate::source::{SourceRecord, TableRef, SOURCE_RECORD_VERSION};
 
 use boundaries::{shard_boundaries, MAX_BUCKETS};
-use queries::{BUCKET, JSON, KEY};
+use queries::{BUCKET, KEY};
 
 /// Buckets sampled for row sizes, and rows read from each. 2,000 rows from 10
 /// buckets bound the sample's cost and are plenty for a mean.
@@ -67,15 +67,6 @@ pub(crate) fn measure_row_sizes(sample: &QueryResult) -> Result<RowSizes> {
         gzip: gzip as f64 / n,
         raw: raw as f64 / n,
     })
-}
-
-/// `Error::BqJob` renders a status as "{code} {reason}: {message}". These
-/// three on the schema probe are the user's query to fix, not a freighter
-/// failure. (Carrying the reason structurally on `Error` is a follow-up.)
-fn user_query_error(message: &str) -> bool {
-    ["400 invalidQuery:", "404 notFound:", "403 accessDenied:"]
-        .iter()
-        .any(|prefix| message.starts_with(prefix))
 }
 
 /// Steps 6 to 8, on the table once it exists: its counts, a row-size sample,
@@ -133,15 +124,27 @@ pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
             cfg.table
         )));
     }
-    // 2. Column types, for free. A query BigQuery rejects (400 invalidQuery:
-    // a missing column, a syntax error) is the user's to fix: exit 2.
+    // 2. Column types, for free. A query BigQuery rejects is the user's to
+    // fix, not a freighter failure: exit 2. Classified by the status's
+    // reason: invalidQuery (a missing column, a syntax error), notFound or
+    // accessDenied (a table the query reads).
     let probe = match jobs
         .query(&cfg.billing_project, &queries::schema_probe(&cfg.query))
         .await
     {
         Ok(p) => p,
-        Err(Error::BqJob(m)) if user_query_error(&m) => {
-            return Err(Error::Refused(format!("the query is not valid: {m}")))
+        Err(Error::BqStatus {
+            reason: Some(reason),
+            code,
+            message,
+        }) if matches!(
+            reason.as_str(),
+            "invalidQuery" | "notFound" | "accessDenied"
+        ) =>
+        {
+            return Err(Error::Refused(format!(
+                "the query is not valid: {code} {reason}: {message}"
+            )))
         }
         Err(e) => return Err(e),
     };
@@ -217,7 +220,6 @@ pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
         table: cfg.table.path(),
         billing_project: cfg.billing_project.clone(),
         rowkey_column: KEY.to_owned(),
-        json_column: JSON.to_owned(),
         range_column: BUCKET.to_owned(),
         boundaries,
         buckets,

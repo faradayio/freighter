@@ -23,10 +23,20 @@ pub enum Error {
     /// uses). The client reports the code; retry policy lives in retry.rs.
     #[error("bigtable rpc {code}: {message}")]
     BigtableRpc { code: i32, message: String },
-    /// A BigQuery jobs-API call that failed after retries: the HTTP error
-    /// body's `reason: message`, or a transport failure.
+    /// A BigQuery jobs-API call that failed after retries on the transport
+    /// or the token, or answered with something freighter cannot decode.
     #[error("bq job: {0}")]
     BqJob(String),
+    /// A BigQuery REST call answered with an error status: the HTTP code,
+    /// BigQuery's `reason` (`notFound`, `invalidQuery`, `rateLimitExceeded`, …)
+    /// and its message. Kept structured so callers classify by `reason`,
+    /// never by parsing the text.
+    #[error("bq job: {code}{}: {message}", reason.as_deref().map(|r| format!(" {r}")).unwrap_or_default())]
+    BqStatus {
+        code: u16,
+        reason: Option<String>,
+        message: String,
+    },
     /// A source record (the `prepare` -> `plan` contract) that fails to
     /// parse or validate.
     #[error("source record: {0}")]

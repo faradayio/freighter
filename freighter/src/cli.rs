@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use freighter::error::{Error, Result};
-use freighter::manifest::CellCompression;
+use freighter::manifest::{CellCompression, MAX_CELL_TIMESTAMP_MICROS, MIN_CELL_TIMESTAMP_MICROS};
 use freighter::plan::ramp::Ramp;
 use freighter::plan::sizing::{parse_memory, SizingConfig, MAX_FLUSH_CELLS, POD_READ_STREAMS};
 use freighter::plan::{Destination, PlanConfig};
@@ -92,6 +92,33 @@ fn parse_ramp(s: &str) -> Result<Ramp> {
     s.parse()
 }
 
+/// The manifest's rules for the one cell timestamp, applied at the command
+/// line so a value in the wrong unit is the user's error (exit 2), not a
+/// refusal of the manifest `plan` rendered.
+fn parse_cell_timestamp(s: &str) -> Result<i64> {
+    let ts: i64 = s
+        .parse()
+        .map_err(|_| Error::Refused(format!("cell timestamp {s:?} is not an integer")))?;
+    if ts <= 0 {
+        return Err(Error::Refused(format!(
+            "cell timestamp {ts} must be positive, in microseconds since the epoch"
+        )));
+    }
+    // The range comes before the whole-millisecond rule: seconds are rarely
+    // a multiple of 1000, and "not microseconds" is the useful message.
+    if !(MIN_CELL_TIMESTAMP_MICROS..=MAX_CELL_TIMESTAMP_MICROS).contains(&ts) {
+        return Err(Error::Refused(format!(
+            "cell timestamp {ts} is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20); seconds or milliseconds would stamp cells in 1970"
+        )));
+    }
+    if ts % 1000 != 0 {
+        return Err(Error::Refused(format!(
+            "cell timestamp {ts} must be a whole number of milliseconds, in microseconds since the epoch"
+        )));
+    }
+    Ok(ts)
+}
+
 fn parse_compression(s: &str) -> Result<CellCompression> {
     s.parse()
 }
@@ -173,7 +200,7 @@ pub struct PlanArgs {
     ramp: Ramp,
     /// The one timestamp every cell carries. Default: now, in whole
     /// milliseconds. Pass the previous plan's value to re-run a load.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_cell_timestamp)]
     cell_timestamp_micros: Option<i64>,
     /// A fresh directory per attempt: verdicts are written beside the manifest.
     #[arg(long, default_value = ".")]
@@ -242,6 +269,23 @@ pub fn parse() -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cell_timestamp_in_the_wrong_unit_is_refused() {
+        let e = parse_cell_timestamp("1792003349")
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("not microseconds"), "{e}");
+        let e = parse_cell_timestamp("1789776000123456")
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("milliseconds"), "{e}");
+        assert_eq!(
+            parse_cell_timestamp("1789776000123000").expect("accepted"),
+            1_789_776_000_123_000
+        );
+    }
+
     #[test]
     fn the_default_cell_timestamp_is_whole_milliseconds() {
         let now = UNIX_EPOCH + std::time::Duration::from_micros(1_234_567_891);

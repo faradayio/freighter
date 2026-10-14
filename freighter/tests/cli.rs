@@ -202,6 +202,17 @@ fn plan_runs_offline_and_its_output_validates() {
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("Gi or Mi"), "{}", stderr(&out));
 
+    let mut secs = common.to_vec();
+    let at = secs.iter().position(|a| *a == "1789776000123000").unwrap();
+    secs[at] = "1792003349";
+    let out = freighter(&secs);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("not microseconds"),
+        "{}",
+        stderr(&out)
+    );
+
     let mut zero = common.to_vec();
     zero.extend(["--read-streams", "0"]);
     assert_eq!(freighter(&zero).status.code(), Some(2));

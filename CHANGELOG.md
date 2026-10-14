@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `freighter prepare`: builds the sharded source table from a `(key, json)`
+  query and writes a source record (a new JSON contract).
+- `freighter plan`: sizes a load from a source record and writes one
+  manifest per ramp step.
+- `freighter verify`: compares a manifest's verdicts with the source table
+  and writes a report (a new JSON contract); exit 0 only when every shard
+  checks out.
+- `freighter validate`: the manifest validator alone, no network.
+- Manifest version 4: `qualifier` and `compression` (`gzip` or `none`).
+  Version 3 manifests are still accepted.
+- Docs: a quickstart and an operating guide.
+
+### Changed
+
+- `freighter move <uri>` is the documented spelling; `freighter <uri>` still works.
+- Library: `cells::TableConfig` gains `qualifier` and `compression`, so code
+  that builds it by struct literal must add them.
+
 ## [0.1.0] - 2026-10-14
 
 ### Added

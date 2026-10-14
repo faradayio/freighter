@@ -60,20 +60,55 @@ per attempt would instead add a cell version per attempt.
 The mover writes counts and leaves the decision to the caller. It can't know
 the source's true row counts without a second BigQuery query, and keeping that
 outside the mover means the mover needs no BigQuery jobs permission and stays
-small.
+small. `freighter verify` is that caller: a separate command, run after the
+mover, with its own permissions. It never counts the Bigtable table, because
+that is a full scan competing with live reads.
+
+## One stage, one file
+
+`prepare`, `plan`, `move` and `verify` are separate commands with one JSON
+document between each and the next: the source record, the manifest, the
+verdicts, the report. No command calls the next one, and nothing is stored
+anywhere but those files. A stage can be re-run, inspected or replaced
+without re-running the ones before it, and an orchestrator can drive the
+stages with nothing but the files. The source record and the verify report
+are versioned contracts like the manifest.
 
 ## Swap boundaries
 
-The mover has two, one per vendor API, plus one shared policy module:
+There is one per vendor API, plus one shared policy module:
 
 - **Bigtable: `freighter/src/client.rs`.** The mover writes through
   `BtClient` and never names `bigtable_rs` types (see below).
 - **BigQuery Storage Read: `freighter/src/bqread.rs`.** The only module that
   names Storage Read or tonic client types. It hands out Arrow
   `RecordBatch`es; everything downstream is BigQuery-agnostic.
+- **BigQuery jobs: `freighter/src/bqjobs.rs`.** The only module that names
+  `reqwest` or the BigQuery jobs REST API. `prepare` and `verify` run their
+  SQL through it; the mover never does.
 - **Retry policy: `freighter/src/retry.rs`** names `tonic::Code`, a gRPC
   status enum, so the read and write paths share one classification of what
-  is transient.
+  is transient. It also classifies HTTP failures for `bqjobs.rs`, and one
+  retry loop serves both.
+
+### Why a thin REST client
+
+`prepare` and `verify` run SQL, which Storage Read cannot do. Two BigQuery
+crates were considered. Google's SDK needs a newer compiler than this crate
+promises to build with, and brings a second TLS stack. The community client
+brings a second HTTP client and a second credential chain, two
+implementations of Application Default Credentials that can disagree about
+which credential files work. The jobs API freighter needs is three endpoints
+of `bigquery/v2`: `POST projects/{p}/queries` to run a statement,
+`GET projects/{p}/queries/{jobId}` to wait for it and page its result, and
+`GET projects/{p}/datasets/{d}/tables/{t}` for a table's metadata. Those fit
+in one module over the HTTP client, credential chain and JSON parser the
+mover already uses: one TLS stack and one way of finding credentials.
+
+Each statement carries a fresh `requestId`, so a POST retried after a
+transport error joins the job the server already started instead of
+launching a second one. There is no job cancellation: a BigQuery job keeps
+running if you stop `prepare`.
 
 ## Choosing the Bigtable client
 

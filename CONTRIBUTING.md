@@ -16,8 +16,9 @@ builds with 1.88.
 ## Testing
 
 ```bash
-./scripts/check.sh          # fmt, clippy (including the emulator target), unit tests
+./scripts/check.sh          # fmt, clippy (including both named test targets), unit tests
 ./scripts/test-emulator.sh  # the Bigtable emulator suite
+./scripts/test-bigquery.sh  # the real-BigQuery suite: prepare, plan, move, verify
 ```
 
 The emulator suite is a separate target that a bare `cargo test` does not run
@@ -32,18 +33,37 @@ unset: a Bigtable test that silently does nothing is indistinguishable from a
 passing one. There are no mocks. Tables are created with `cbt` (the client
 crate has no admin API) and round trips run against the emulator.
 
-`cargo clippy --all-targets` does **not** reach the emulator target. `check.sh`
-lints it by name.
+The BigQuery suite is a second `test = false` target. It runs `prepare` on a
+1.5-million-row synthetic table in a real dataset, then `plan`, `move` into the
+emulator and `verify`, and exercises the jobs client against the live API.
+It needs:
+
+| Variable | Meaning |
+|---|---|
+| `FREIGHTER_TEST_DATASET` | `<project>.<dataset>`, a BigQuery dataset you may write to |
+| `BIGTABLE_EMULATOR_HOST` | a running emulator, e.g. `localhost:8086` (start one with `gcloud beta emulators bigtable start --host-port=localhost:8086`) |
+
+and Application Default Credentials (`gcloud auth application-default login`).
+The script refuses to start without them, and the suite panics rather than
+skipping. It creates its tables with a one-day expiry and drops them. CI does
+not run it, because it needs real credentials; run it before a release and
+after any change to `prepare`, `verify` or `bqjobs.rs`.
+
+`cargo clippy --all-targets` does **not** reach the two `test = false`
+targets. `check.sh` lints them by name.
 
 ## Conventions
 
 - One crate-level error enum (`freighter/src/error.rs`).
-- Only `client.rs` names Bigtable client types, and only `bqread.rs` names
-  BigQuery Storage Read types. See "Swap boundaries" in
+- Only `client.rs` names Bigtable client types, only `bqread.rs` names
+  BigQuery Storage Read types, and only `bqjobs.rs` names `reqwest` or the
+  BigQuery jobs REST API. See "Swap boundaries" in
   [docs/design.md](docs/design.md).
 - Library code logs through `log`; no bare `println!`.
 - The manifest and verdict formats are a contract. Changing a field means a
-  new manifest `version`, updated fixtures, and a CHANGELOG entry.
+  new manifest `version`, updated fixtures, and a CHANGELOG entry. The source
+  record and the verify report are contracts like the manifest, each with its
+  own `version` and fixture in `freighter/fixtures/`.
 
 ## Releasing
 

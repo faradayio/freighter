@@ -17,7 +17,8 @@ source table ──cut into──▶ buckets (one value of the bucket column eac
 **Source table.** A BigQuery table with one row per Bigtable row: a STRING
 row-key column, a STRING `json` column, and an INT64 **bucket column**. It is
 integer-range partitioned on the bucket column, so reading a bucket range
-prunes to exactly those partitions, and clustered on the key. See
+prunes to exactly those partitions, and clustered on the key. `freighter
+prepare` builds it, along with a *source record* describing it. See
 [Preparing a source table](preparing-a-source-table.md).
 
 **Row key.** The key string's UTF-8 bytes become the Bigtable row key as they
@@ -69,11 +70,14 @@ lifetime.
 **Cell timestamp.** One timestamp, picked once per *load*, carried by every
 cell. Re-running a shard rewrites identical cells at an identical timestamp,
 which is what makes a relaunch safe. Picking a new timestamp on a retry would
-create a second version of every cell, so persist it with the load.
+create a second version of every cell, so persist it with the load. `freighter
+plan` picks it once per invocation and writes it into every manifest it
+produces; a re-run passes it back with `--cell-timestamp-micros`.
 
 **Manifest.** The versioned JSON document handed to the mover: source,
 destination, shards and their lanes, tuning knobs, and the cell timestamp.
-The mover is its only validator and refuses anything it doesn't recognize.
+`freighter plan` writes it. The mover is its only validator and refuses
+anything it doesn't recognize; `freighter validate` runs that validator alone.
 See the [Manifest reference](manifest.md).
 
 **Verdict.** A per-shard JSON result (`shard_NNNN.json`, written beside the
@@ -84,7 +88,8 @@ manifest): rows read, cells acknowledged and failed, retries, timings, and
 **Verification.** For each shard, compare the cells it acknowledged with a
 count of source rows over its buckets. A shard with a missing, failed or
 mismatched verdict gets re-run. This is the load's only success criterion.
-See [Verifying a load](verifying-a-load.md).
+`freighter verify` does it and writes a *verify report*. See
+[Verifying a load](verifying-a-load.md).
 
 **`expect_empty`.** A per-shard flag saying the shard may read zero rows.
 Without it an empty shard fails, because an empty read usually means the
@@ -97,6 +102,9 @@ lanes finish, and the process exits non-zero naming every lane that stopped.
 the shards at 1 lane, then half the lanes, then all of them, with a check
 between runs. It's a rollout practice for writing into a table that serves
 live traffic. Each step is its own manifest and its own mover run.
+`freighter plan --ramp 0.05,0.10,0.85` produces the steps, each in its own
+directory. See [Sizing a load](sizing.md#ramp) and
+[Operating a load](operating.md).
 
 **App profile.** The Bigtable app profile the mover writes through. A
 low-priority profile lets serving reads win when the cluster is busy.

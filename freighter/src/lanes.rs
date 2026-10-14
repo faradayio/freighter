@@ -271,7 +271,7 @@ mod tests {
         rows: u64,
     ) -> crate::manifest::ShardVerdict {
         crate::manifest::ShardVerdict {
-            manifest_version: 3,
+            manifest_version: 4,
             shard_index: index,
             rows_read: rows,
             cells_encoded: 0,

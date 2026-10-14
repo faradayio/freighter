@@ -8,7 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub const MOVE_MANIFEST_VERSION: u32 = 3;
+/// The version `plan` writes.
+pub const MOVE_MANIFEST_VERSION: u32 = 4;
+/// What this mover reads. A version-3 document is read as version 4 with
+/// `qualifier` and `compression` at their defaults, so a caller that renders
+/// v3 keeps working across the bump.
+pub const SUPPORTED_MANIFEST_VERSIONS: [u32; 2] = [3, 4];
 
 /// The smallest plausible `cell_timestamp_micros`: 2001-09-09 in microseconds.
 /// A timestamp given in seconds or milliseconds sits far below it and would
@@ -33,7 +38,7 @@ struct VersionProbe {
 // deny_unknown_fields cannot apply to this internally-tagged enum (serde
 // limitation), so an extra key beside `lo`/`hi` is silently dropped —
 // accepted residual.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ShardRange {
     /// Contiguous signed-int64 range of the manifest's range column,
@@ -41,7 +46,7 @@ pub enum ShardRange {
     Int { lo: i64, hi: i64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardSpec {
     pub index: u32,
@@ -77,7 +82,46 @@ impl std::fmt::Display for ShardLabel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// How the cell value is encoded from the `json` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CellCompression {
+    /// gzip at flate2's default level — the framing Java's GZIPInputStream reads.
+    #[default]
+    Gzip,
+    /// The `json` string's UTF-8 bytes as they are. Named so it never reads
+    /// as `Option::None` in a match.
+    #[serde(rename = "none")]
+    Uncompressed,
+}
+
+impl std::str::FromStr for CellCompression {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "gzip" => Ok(Self::Gzip),
+            "none" => Ok(Self::Uncompressed),
+            other => Err(Error::Refused(format!(
+                "compression {other:?}: expected gzip or none"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for CellCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gzip => "gzip",
+            Self::Uncompressed => "none",
+        })
+    }
+}
+
+fn default_qualifier() -> String {
+    "jsonz".to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MoveManifest {
     pub version: u32,
@@ -95,6 +139,12 @@ pub struct MoveManifest {
     /// every check here and quietly loses the append-order write path.
     pub range_column: String,
     pub family: String,
+    /// Column qualifier of the one cell. v4; a v3 document gets `jsonz`.
+    #[serde(default = "default_qualifier")]
+    pub qualifier: String,
+    /// Cell value encoding. v4; a v3 document gets gzip.
+    #[serde(default)]
+    pub compression: CellCompression,
     pub bt_project: String,
     pub bt_instance: String,
     pub destination_table: String,
@@ -125,15 +175,24 @@ pub struct MoveManifest {
     pub rung: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Complete,
     Failed,
 }
 
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        })
+    }
+}
+
 /// A mover's verdict on one shard: outcome, row/cell counts, latencies, and resilience counters.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardVerdict {
     pub manifest_version: u32,
     pub shard_index: u32,
@@ -228,9 +287,9 @@ impl MoveManifest {
     pub fn from_json(doc: &str) -> Result<Self> {
         let probe: VersionProbe =
             serde_json::from_str(doc).map_err(|e| Error::Manifest(format!("parse: {e}")))?;
-        if probe.version != MOVE_MANIFEST_VERSION {
+        if !SUPPORTED_MANIFEST_VERSIONS.contains(&probe.version) {
             return Err(Error::Manifest(format!(
-                "version {} unsupported; this mover understands {MOVE_MANIFEST_VERSION}",
+                "version {} unsupported; this mover understands 3 or 4",
                 probe.version
             )));
         }
@@ -258,6 +317,11 @@ impl MoveManifest {
         if m.range_column == m.rowkey_column {
             return Err(Error::Manifest(
                 "range_column must name an integer column distinct from the rowkey column — int-banding a string keyspace is refused".to_owned(),
+            ));
+        }
+        if m.qualifier.is_empty() {
+            return Err(Error::Manifest(
+                "qualifier must be non-empty — it names the cell's column".to_owned(),
             ));
         }
         let ts = m.cell_timestamp_micros;

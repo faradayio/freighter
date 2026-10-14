@@ -12,6 +12,7 @@ use arrow_schema::{DataType, Field, Schema};
 use freighter::cells::TableConfig;
 use freighter::client::{BtClient, RawRow, RowWrite};
 use freighter::error::Result;
+use freighter::manifest::CellCompression;
 use freighter::write::{collect_sorted, write_sorted, Counters, WriteRows};
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_filter::Filter;
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::RowFilter;
@@ -159,6 +160,8 @@ pub fn lookup_config() -> TableConfig {
     TableConfig {
         rowkey_column: "key".into(),
         family: "data".into(),
+        qualifier: b"jsonz".to_vec(),
+        compression: CellCompression::Gzip,
         cell_timestamp_micros: LOOKUP_TIMESTAMP_MICROS,
         null_json_deletes_row: false,
     }

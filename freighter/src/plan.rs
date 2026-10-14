@@ -46,6 +46,7 @@ pub fn plan(source: &SourceRecord, cfg: &PlanConfig) -> Result<Vec<MoveManifest>
     steps
         .into_iter()
         .map(|step| {
+            let (index, lanes) = (step.index, step.lanes);
             let m = MoveManifest {
                 version: MOVE_MANIFEST_VERSION,
                 source_table: source.table.clone(),
@@ -67,17 +68,18 @@ pub fn plan(source: &SourceRecord, cfg: &PlanConfig) -> Result<Vec<MoveManifest>
                 null_json_deletes_row: source.null_json_deletes_row,
                 rung: load.rung,
             };
-            log::info!(
-                "plan: step {} — {} lanes, {} shards, {} cells in flight",
-                step.index,
-                step.lanes,
-                m.shards.len(),
-                m.inflight_mutations
-            );
             let json =
                 serde_json::to_string(&m).map_err(|e| Error::Plan(format!("render: {e}")))?;
-            MoveManifest::from_json(&json)
-                .map_err(|e| Error::Plan(format!("rendered a manifest the mover refuses: {e}")))
+            let checked = MoveManifest::from_json(&json)
+                .map_err(|e| Error::Plan(format!("rendered a manifest the mover refuses: {e}")))?;
+            log::info!(
+                "plan: step {} — {} lanes, {} shards, {} cells in flight",
+                index,
+                lanes,
+                checked.shards.len(),
+                checked.inflight_mutations
+            );
+            Ok(checked)
         })
         .collect()
 }
@@ -86,21 +88,34 @@ pub fn plan(source: &SourceRecord, cfg: &PlanConfig) -> Result<Vec<MoveManifest>
 /// for a ramp. The mover writes verdicts beside its manifest and shard
 /// indexes are global across steps, so steps sharing a directory would read
 /// each other's verdicts as strays.
+///
+/// Refuses to overwrite: a directory that already holds a manifest also holds
+/// that attempt's verdicts.
 pub fn write_manifests(out_dir: &Path, manifests: &[MoveManifest]) -> Result<Vec<PathBuf>> {
+    // Local files are storage too; the variant is not GCS-specific.
     let io = |e: std::io::Error, p: &Path| Error::Storage(format!("{}: {e}", p.display()));
-    let mut paths = Vec::with_capacity(manifests.len());
-    for (i, m) in manifests.iter().enumerate() {
-        let dir = if manifests.len() == 1 {
-            out_dir.to_path_buf()
-        } else {
-            out_dir.join(format!("step-{i}"))
-        };
-        std::fs::create_dir_all(&dir).map_err(|e| io(e, &dir))?;
-        let path = dir.join("manifest.json");
+    let paths: Vec<PathBuf> = (0..manifests.len())
+        .map(|i| {
+            if manifests.len() == 1 {
+                out_dir.join("manifest.json")
+            } else {
+                out_dir.join(format!("step-{i}")).join("manifest.json")
+            }
+        })
+        .collect();
+    if let Some(existing) = paths.iter().find(|p| p.exists()) {
+        return Err(Error::Refused(format!(
+            "{} already exists; each attempt needs a fresh --out-dir, because verdicts land beside the manifest",
+            existing.display()
+        )));
+    }
+    for (path, m) in paths.iter().zip(manifests) {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
+        }
         let json =
             serde_json::to_string_pretty(m).map_err(|e| Error::Plan(format!("render: {e}")))?;
-        std::fs::write(&path, json).map_err(|e| io(e, &path))?;
-        paths.push(path);
+        std::fs::write(path, json).map_err(|e| io(e, path))?;
     }
     Ok(paths)
 }
@@ -137,14 +152,15 @@ mod tests {
     }
 
     #[test]
-    fn a_single_step_plan_is_one_validated_v4_manifest() {
+    fn a_single_step_plan_is_one_v4_manifest_the_mover_accepts() {
         let source = SourceRecord::from_json(SOURCE_FIXTURE).unwrap();
         let manifests = plan(&source, &config(1, "2Gi", "1.0")).unwrap();
         assert_eq!(manifests.len(), 1);
         let m = &manifests[0];
         assert_eq!(m.version, MOVE_MANIFEST_VERSION);
         assert_eq!(m.source_table, source.table);
-        assert_eq!(m.billing_project, "example-project");
+        assert_eq!(m.billing_project, source.billing_project);
+        MoveManifest::from_json(&serde_json::to_string(m).unwrap()).unwrap();
         assert_eq!(
             (m.rowkey_column.as_str(), m.range_column.as_str()),
             ("key", "bucket")
@@ -181,20 +197,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("freighter-plan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let one = plan(&source, &config(1, "2Gi", "1.0")).unwrap();
-        let paths = write_manifests(&dir, &one).unwrap();
-        assert_eq!(paths, vec![dir.join("manifest.json")]);
+        let one_dir = dir.join("one");
+        let paths = write_manifests(&one_dir, &one).unwrap();
+        assert_eq!(paths, vec![one_dir.join("manifest.json")]);
         let back = MoveManifest::from_json(&std::fs::read_to_string(&paths[0]).unwrap()).unwrap();
         assert_eq!(back, one[0]);
         let three = plan(&source, &config(1, "2Gi", "0.05,0.10,0.85")).unwrap();
-        let paths = write_manifests(&dir, &three).unwrap();
+        let ramp_dir = dir.join("ramp");
+        let paths = write_manifests(&ramp_dir, &three).unwrap();
         assert_eq!(
             paths,
             vec![
-                dir.join("step-0/manifest.json"),
-                dir.join("step-1/manifest.json"),
-                dir.join("step-2/manifest.json")
+                ramp_dir.join("step-0/manifest.json"),
+                ramp_dir.join("step-1/manifest.json"),
+                ramp_dir.join("step-2/manifest.json")
             ]
         );
+        let err = write_manifests(&one_dir, &one).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

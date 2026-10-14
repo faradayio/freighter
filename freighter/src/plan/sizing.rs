@@ -5,8 +5,7 @@ use crate::error::{Error, Result};
 use crate::manifest::CellCompression;
 use crate::source::SourceRecord;
 
-/// manifest.rs refuses flush_cells outside (0, 90000].
-pub const MAX_FLUSH_CELLS: usize = 90_000;
+pub use crate::manifest::MAX_FLUSH_CELLS;
 /// What a resident row costs the mover beyond its key and value: the
 /// RowWrite and CellWrite structs, five small heap allocations with
 /// allocator overhead and rounding, and up to ~96 B while the shard's row
@@ -19,6 +18,9 @@ pub const RESIDENCY_SAFETY: f64 = 1.3;
 pub const RESIDENT_SHARDS_PER_LANE: u32 = 2;
 /// Runtime and gRPC channels.
 pub const RESIDENCY_FIXED_BYTES: f64 = 1_000_000_000.0;
+/// The in-flight budget counts twice: a slice's decoded rows and its
+/// serialized request are both resident until the RPC returns.
+pub const INFLIGHT_COPIES: f64 = 2.0;
 /// Storage Read streams across the pod; each lane's session gets an equal
 /// share so decode (gzip) parallelism does not grow with the lane count.
 pub const POD_READ_STREAMS: i32 = 32;
@@ -26,9 +28,12 @@ pub const POD_READ_STREAMS: i32 = 32;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SizingConfig {
     pub lanes: u32,
+    /// The mover process's memory, in bytes (from `--memory`).
     pub memory_bytes: u64,
     pub compression: CellCompression,
+    /// Bytes per MutateRows request; sets `flush_cells`.
     pub target_request_bytes: u64,
+    /// Caller cap on rows per request, at or under `MAX_FLUSH_CELLS`.
     pub max_flush_cells: usize,
     /// Pod total; shared out per lane.
     pub read_streams: i32,
@@ -57,10 +62,14 @@ pub fn parse_memory(s: &str) -> Result<u64> {
         return Err(refuse());
     };
     let value: f64 = number.parse().map_err(|_| refuse())?;
-    if value.is_nan() || value <= 0.0 {
+    if !value.is_finite() || value <= 0.0 {
         return Err(refuse());
     }
-    Ok((value * (1u64 << shift) as f64) as u64)
+    let bytes = (value * (1u64 << shift) as f64) as u64;
+    if bytes == 0 {
+        return Err(refuse());
+    }
+    Ok(bytes)
 }
 
 /// One MutateRows request in flight per lane: the mover admits requests
@@ -86,10 +95,15 @@ pub fn plan_load(source: &SourceRecord, cfg: &SizingConfig) -> Result<LoadPlan> 
     let row_bytes = source.row_bytes(cfg.compression);
     // `from_json` checks this too, but a record built by hand (the tests do)
     // bypasses it; NaN must be refused here as well.
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(row_bytes > 0.0) {
+    if !(row_bytes.is_finite() && row_bytes > 0.0) {
         return Err(Error::Refused(format!(
             "bytes per row {row_bytes} must be positive: the source's row size was not measured"
+        )));
+    }
+    if cfg.read_streams <= 0 {
+        return Err(Error::Refused(format!(
+            "read_streams {} must be positive",
+            cfg.read_streams
         )));
     }
     if cfg.max_flush_cells == 0 || cfg.max_flush_cells > MAX_FLUSH_CELLS {
@@ -104,17 +118,27 @@ pub fn plan_load(source: &SourceRecord, cfg: &SizingConfig) -> Result<LoadPlan> 
     let inflight_bytes = inflight_mutations(flush_cells, cfg.lanes) as f64 * row_bytes;
     let resident_row_bytes = (row_bytes + RESIDENT_ROW_OVERHEAD_BYTES) * RESIDENCY_SAFETY;
     let rows_per_bucket = source.max_rows_per_bucket as f64;
-    let shard_budget = (cfg.memory_bytes as f64 - RESIDENCY_FIXED_BYTES - 2.0 * inflight_bytes)
-        / (cfg.lanes * RESIDENT_SHARDS_PER_LANE) as f64;
-    let buckets_per_shard = (shard_budget / (rows_per_bucket * resident_row_bytes)).floor();
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(buckets_per_shard >= 1.0) {
+    let overhead = RESIDENCY_FIXED_BYTES + INFLIGHT_COPIES * inflight_bytes;
+    let gib = |b: f64| b / (1u64 << 30) as f64;
+    if cfg.memory_bytes as f64 <= overhead {
         return Err(Error::Refused(format!(
-            "one bucket ({} rows, {:.2}GB resident) does not fit a resident shard's {:.2}GB share of {} bytes at {} lanes, two shards a lane: build the source with more buckets, or use fewer lanes",
+            "memory {:.2}GiB leaves nothing for shards after {:.2}GiB fixed and {:.2}GiB of in-flight requests at {} lanes: raise memory or lower lanes",
+            gib(cfg.memory_bytes as f64),
+            gib(RESIDENCY_FIXED_BYTES),
+            gib(INFLIGHT_COPIES * inflight_bytes),
+            cfg.lanes
+        )));
+    }
+    let shard_budget = (cfg.memory_bytes as f64 - overhead)
+        / (f64::from(cfg.lanes) * f64::from(RESIDENT_SHARDS_PER_LANE));
+    let buckets_per_shard = (shard_budget / (rows_per_bucket * resident_row_bytes)).floor();
+    if buckets_per_shard < 1.0 {
+        return Err(Error::Refused(format!(
+            "one bucket ({} rows, {:.2}GiB resident) does not fit a resident shard's {:.2}GiB share of {:.2}GiB at {} lanes, two shards a lane: build the source with more buckets, or use fewer lanes",
             source.max_rows_per_bucket,
-            rows_per_bucket * resident_row_bytes / 1e9,
-            shard_budget / 1e9,
-            cfg.memory_bytes,
+            gib(rows_per_bucket * resident_row_bytes),
+            gib(shard_budget),
+            gib(cfg.memory_bytes as f64),
             cfg.lanes
         )));
     }
@@ -223,7 +247,7 @@ mod tests {
 
     #[test]
     fn refuses_an_unmeasured_row_size() {
-        for unmeasured in [0.0, -1.0, f64::NAN] {
+        for unmeasured in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let err =
                 plan_load(&source(1_000_000, unmeasured, 100, None), &cfg(2, "24Gi")).unwrap_err();
             assert!(err.to_string().contains("must be positive"), "{err}");
@@ -235,7 +259,16 @@ mod tests {
         assert_eq!(parse_memory("24Gi").unwrap(), 24 * (1u64 << 30));
         assert_eq!(parse_memory("1.5Gi").unwrap(), 3 * (1u64 << 29));
         assert_eq!(parse_memory("512Mi").unwrap(), 512 * (1u64 << 20));
-        for other in ["24G", "24", "Gi", "-1Gi", "24gi"] {
+        for other in [
+            "24G",
+            "24",
+            "Gi",
+            "-1Gi",
+            "24gi",
+            "infGi",
+            "NaNGi",
+            "0.0000001Mi",
+        ] {
             let err = parse_memory(other).unwrap_err();
             assert!(err.to_string().contains("Gi or Mi"), "{other}: {err}");
         }
@@ -245,7 +278,7 @@ mod tests {
     fn never_reads_the_logical_bytes_per_row() {
         let mut a = source(249_000_000, 500.0, 4000, None);
         let mut b = a.clone();
-        a.logical_bytes_per_row = 500.0;
+        a.logical_bytes_per_row = 400.0;
         b.logical_bytes_per_row = 5000.0;
         assert_eq!(
             plan_load(&a, &cfg(8, "24Gi")).unwrap(),
@@ -255,13 +288,15 @@ mod tests {
 
     #[test]
     fn shards_cover_every_bucket_once() {
-        let plan = plan_load(&large_source(), &cfg(8, "24Gi")).unwrap();
+        let src = source(249_000_000, 500.0, 4010, Some(70_000));
+        let plan = plan_load(&src, &cfg(8, "24Gi")).unwrap();
+        assert_eq!(plan.shard_ranges.last(), Some(&(4000, 4009)));
         let covered: Vec<i64> = plan
             .shard_ranges
             .iter()
             .flat_map(|&(lo, hi)| lo..=hi)
             .collect();
-        assert_eq!(covered, (0..4000).collect::<Vec<i64>>());
+        assert_eq!(covered, (0..4010).collect::<Vec<i64>>());
     }
 
     #[test]
@@ -300,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn gives_one_lane_the_whole_stream_share() {
+    fn every_lane_gets_at_least_one_read_stream() {
         assert_eq!(
             plan_load(&large_source(), &cfg(64, "64Gi"))
                 .unwrap()
@@ -315,6 +350,11 @@ mod tests {
         let err = plan_load(&coarse, &cfg(8, "2Gi")).unwrap_err();
         assert!(err.to_string().contains("does not fit"), "{err}");
         assert!(matches!(err, Error::Refused(_)));
+        let err = plan_load(&coarse, &cfg(8, "512Mi")).unwrap_err();
+        assert!(
+            err.to_string().contains("leaves nothing for shards"),
+            "{err}"
+        );
     }
 
     #[test]

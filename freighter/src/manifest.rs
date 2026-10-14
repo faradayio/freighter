@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// MutateRows allows 100k mutations per request; one row is one mutation, so
+/// this stays under it with room.
+pub const MAX_FLUSH_CELLS: usize = 90_000;
 /// The version `plan` writes.
 pub const MOVE_MANIFEST_VERSION: u32 = 4;
 /// What this mover reads. A version-3 document is read as version 4 with
@@ -350,7 +353,7 @@ impl MoveManifest {
         // MutateRows allows up to 100k entries and 100k mutations per
         // request. A row is one cell or one delete, so a request of
         // `flush_cells` rows is that many of each.
-        if m.flush_cells == 0 || m.flush_cells > 90_000 {
+        if m.flush_cells == 0 || m.flush_cells > MAX_FLUSH_CELLS {
             return Err(Error::Manifest(format!(
                 "flush_cells {} outside (0, 90000] — stay below the 100k mutation limit",
                 m.flush_cells

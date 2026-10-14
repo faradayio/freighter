@@ -176,7 +176,7 @@ impl SourceRecord {
         ] {
             // Fields are pub, so a hand-built record can carry NaN; JSON cannot.
             #[allow(clippy::neg_cmp_op_on_partial_ord)]
-            if !(v > 0.0) {
+            if !(v.is_finite() && v > 0.0) {
                 return Err(Error::Source(format!(
                     "{name} {v} must be positive: the source's row size was not measured"
                 )));

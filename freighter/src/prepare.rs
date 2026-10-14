@@ -3,3 +3,4 @@
 //! the cut is `boundaries`, the SQL is `queries`.
 
 pub mod boundaries;
+pub mod queries;

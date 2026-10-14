@@ -260,7 +260,7 @@ pub struct ShardVerdict {
 /// CROSS-lane disjointness is the launcher's guarantee (it partitions the
 /// shard ranges), not validated here — this tripwire covers
 /// within-lane order only.
-fn validate_lanes(shards: &[ShardSpec]) -> Result<()> {
+pub(crate) fn validate_lanes(shards: &[ShardSpec]) -> Result<()> {
     let max_lane = shards.iter().map(|s| s.lane).max().unwrap_or(0);
     if max_lane == 0 {
         return Ok(());

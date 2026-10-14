@@ -15,6 +15,7 @@ use super::sizing::{inflight_mutations, LoadPlan};
 pub struct Ramp(Vec<f64>);
 
 impl Ramp {
+    /// In step order; validated by `FromStr`.
     pub fn fractions(&self) -> &[f64] {
         &self.0
     }
@@ -28,12 +29,16 @@ impl FromStr for Ramp {
             .map(|part| {
                 part.trim()
                     .parse::<f64>()
-                    .map_err(|_| Error::Refused(format!("ramp fraction {part:?} is not a number")))
+                    .ok()
+                    .filter(|f| f.is_finite() && *f > 0.0)
+                    .ok_or_else(|| {
+                        Error::Refused(format!("ramp fraction {part:?} must be a positive number"))
+                    })
             })
             .collect::<Result<Vec<f64>>>()?;
         if !(1..=3).contains(&fractions.len()) {
             return Err(Error::Refused(format!(
-                "1 to 3 ramp steps, got {}",
+                "ramp {s:?}: 1 to 3 steps, got {}",
                 fractions.len()
             )));
         }
@@ -46,6 +51,7 @@ impl FromStr for Ramp {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+/// One ramp step: its lanes (the ladder's rung, capped at the step's shard count) and its shards, lane-major.
 pub struct RampStep {
     pub index: usize,
     pub lanes: u32,
@@ -63,7 +69,8 @@ pub struct RampStep {
 /// Dealing is by CONTIGUOUS BLOCK: lane j takes the j-th equal run of the
 /// step's ascending shards, so each lane writes one contiguous key region
 /// and the lanes' cursors sit in distant regions. Round-robin would park
-/// every cursor in neighbouring tablets.
+/// every cursor in neighbouring tablets, so one tablet server takes every
+/// lane's writes at once.
 pub fn plan_ramp(plan: &LoadPlan, ramp: &Ramp) -> Result<Vec<RampStep>> {
     let fractions = ramp.fractions();
     let ladder = [1, (plan.lanes / 2).max(1), plan.lanes];
@@ -80,7 +87,7 @@ pub fn plan_ramp(plan: &LoadPlan, ramp: &Ramp) -> Result<Vec<RampStep>> {
             n
         } else {
             let rounded = (n as f64 * cumulative * 1e9).round() / 1e9;
-            (rounded.ceil() as usize).max(start + 1)
+            (rounded.ceil() as usize).max(start + 1).min(n)
         };
         if end <= start {
             return Err(Error::Refused(format!(
@@ -119,7 +126,6 @@ pub fn plan_ramp(plan: &LoadPlan, ramp: &Ramp) -> Result<Vec<RampStep>> {
 mod tests {
     use super::*;
     use crate::manifest::ShardRange;
-    use std::collections::{HashMap, HashSet};
 
     fn plan(shards: usize, lanes: u32) -> LoadPlan {
         LoadPlan {
@@ -138,17 +144,10 @@ mod tests {
     /// manifest.rs validate_lanes: lanes dense from 0; within a lane, listed
     /// ranges strictly ascending and disjoint.
     fn assert_lane_rules(shards: &[ShardSpec]) {
-        let lanes: HashSet<u32> = shards.iter().map(|s| s.lane).collect();
-        let max = *lanes.iter().max().unwrap();
-        assert_eq!(lanes, (0..=max).collect());
-        let mut last_hi: HashMap<u32, i64> = HashMap::new();
+        crate::manifest::validate_lanes(shards).expect("the mover's lane rules hold");
         for s in shards {
             let ShardRange::Int { lo, hi } = s.range;
             assert!(lo <= hi);
-            if let Some(prev) = last_hi.get(&s.lane) {
-                assert!(lo > *prev);
-            }
-            last_hi.insert(s.lane, hi);
         }
     }
 
@@ -248,6 +247,12 @@ mod tests {
     }
 
     #[test]
+    fn refuses_when_there_are_fewer_shards_than_steps() {
+        let err = plan_ramp(&plan(1, 2), &ramp("0.05,0.10,0.85")).unwrap_err();
+        assert!(err.to_string().contains("ramp step 1 is empty"), "{err}");
+    }
+
+    #[test]
     fn ramp_parses_fractions_and_refuses_bad_ones() {
         assert_eq!("1.0".parse::<Ramp>().unwrap(), Ramp(vec![1.0]));
         assert_eq!(
@@ -257,8 +262,13 @@ mod tests {
         let err = "0.5,0.4".parse::<Ramp>().unwrap_err();
         assert!(err.to_string().contains("must sum to 1"), "{err}");
         let err = "0.25,0.25,0.25,0.25".parse::<Ramp>().unwrap_err();
-        assert!(err.to_string().contains("1 to 3 ramp steps"), "{err}");
+        assert!(err.to_string().contains("1 to 3 steps"), "{err}");
         assert!("".parse::<Ramp>().is_err());
         assert!("a,b".parse::<Ramp>().is_err());
+        assert!("nan".parse::<Ramp>().is_err());
+        assert!("inf".parse::<Ramp>().is_err());
+        assert!("1.5,-0.5".parse::<Ramp>().is_err());
+        let err = "0,1".parse::<Ramp>().unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
     }
 }

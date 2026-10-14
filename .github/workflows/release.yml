@@ -1,16 +1,23 @@
 name: Release
 
+# A tag publishes. A manual run builds the binaries and image without
+# publishing anything, to prove a workflow change before tagging.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
 
+env:
+  VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
+
 jobs:
   binaries:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, zig: true }
@@ -20,9 +27,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99
-        with:
-          targets: ${{ matrix.target }}
+      # Install the toolchain rust-toolchain.toml pins and add the target to
+      # that one: a setup action's own toolchain is not the one cargo uses here.
+      - run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
       - if: matrix.zig
         uses: mlugg/setup-zig@v2
       - if: matrix.zig
@@ -38,7 +47,7 @@ jobs:
           fi
       - name: Package
         run: |
-          name="freighter-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="freighter-${{ env.VERSION }}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/freighter" README.md LICENSE-APACHE LICENSE-MIT "$name/"
           tar czf "$name.tar.gz" "$name"
@@ -49,6 +58,7 @@ jobs:
           path: freighter-*.tar.gz*
 
   github-release:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: binaries
     runs-on: ubuntu-latest
     steps:
@@ -84,7 +94,7 @@ jobs:
           for pair in amd64:x86_64 arm64:aarch64; do
             arch="${pair%%:*}"; target="${pair##*:}-unknown-linux-musl"
             mkdir -p "bin/$arch"
-            tar xzf "dist/freighter-${GITHUB_REF_NAME}-${target}.tar.gz" --strip-components=1 -C "bin/$arch"
+            tar xzf "dist/freighter-${{ env.VERSION }}-${target}.tar.gz" --strip-components=1 -C "bin/$arch"
           done
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -96,7 +106,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
@@ -104,6 +114,7 @@ jobs:
   # Last, and only once everything else succeeded: a crates.io publish can't
   # be undone.
   crates-io:
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [github-release, image]
     runs-on: ubuntu-latest
     steps:

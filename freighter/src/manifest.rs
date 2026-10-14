@@ -12,7 +12,9 @@ use crate::error::{Error, Result};
 pub const MOVE_MANIFEST_VERSION: u32 = 4;
 /// What this mover reads. A version-3 document is read as version 4 with
 /// `qualifier` and `compression` at their defaults, so a caller that renders
-/// v3 keeps working across the bump.
+/// v3 keeps working across the bump. The version is not cross-checked against
+/// field presence: a v3 document carrying the v4 fields, or a v4 document
+/// without them, both parse.
 pub const SUPPORTED_MANIFEST_VERSIONS: [u32; 2] = [3, 4];
 
 /// The smallest plausible `cell_timestamp_micros`: 2001-09-09 in microseconds.
@@ -192,6 +194,9 @@ impl std::fmt::Display for Outcome {
 }
 
 /// A mover's verdict on one shard: outcome, row/cell counts, latencies, and resilience counters.
+///
+/// Deliberately no `deny_unknown_fields`: a verdict from a newer mover may carry
+/// counters this `verify` doesn't know, and it must still be readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardVerdict {
     pub manifest_version: u32,
@@ -288,6 +293,7 @@ impl MoveManifest {
         let probe: VersionProbe =
             serde_json::from_str(doc).map_err(|e| Error::Manifest(format!("parse: {e}")))?;
         if !SUPPORTED_MANIFEST_VERSIONS.contains(&probe.version) {
+            // Keep in step with SUPPORTED_MANIFEST_VERSIONS.
             return Err(Error::Manifest(format!(
                 "version {} unsupported; this mover understands 3 or 4",
                 probe.version

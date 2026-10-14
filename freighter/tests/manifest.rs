@@ -55,6 +55,7 @@ fn refuses_wrong_version() {
                 .contains(&format!("version {wrong} unsupported")),
             "{err}"
         );
+        assert!(err.to_string().contains("understands 3 or 4"), "{err}");
     }
 }
 
@@ -101,7 +102,7 @@ fn refuses_wrong_version_even_when_body_is_unparseable() {
     let err = MoveManifest::from_json(&doc.to_string()).unwrap_err();
     assert!(err.to_string().contains("version"), "{err}");
     // And with ADDED fields: pins that VersionProbe itself carries no
-    // deny_unknown_fields — a v4 doc with new knobs still gets the
+    // deny_unknown_fields — a v5 doc with new knobs still gets the
     // version message, never an unknown-field error.
     let mut doc2: serde_json::Value = serde_json::from_str(LOOKUP_MANIFEST_FIXTURE).unwrap();
     doc2["version"] = serde_json::json!(5);
@@ -345,13 +346,6 @@ fn refuses_an_empty_qualifier() {
 }
 
 #[test]
-fn version_message_names_both_supported_versions() {
-    let doc = lookup_fixture_with("\"version\": 4", "\"version\": 5");
-    let err = MoveManifest::from_json(&doc).unwrap_err();
-    assert!(err.to_string().contains("understands 3 or 4"), "{err}");
-}
-
-#[test]
 fn a_manifest_round_trips_through_serde() {
     let m = MoveManifest::from_json(LOOKUP_MANIFEST_FIXTURE).unwrap();
     let json = serde_json::to_string(&m).unwrap();
@@ -362,14 +356,32 @@ fn a_manifest_round_trips_through_serde() {
 }
 
 #[test]
-fn a_verdict_round_trips_through_serde() {
+fn a_verdict_parses_and_tolerates_unknown_fields() {
     let v: ShardVerdict = serde_json::from_str(VERDICT_FIXTURE).unwrap();
     assert_eq!(v.manifest_version, 4);
     assert_eq!(v.cells_acknowledged, 6_245_100);
     assert!(matches!(v.outcome, Outcome::Complete));
-    // Lenient on purpose: a newer mover's extra counter must not break verify.
+    // Lenient on purpose — see the ShardVerdict doc in manifest.rs.
     let mut doc: serde_json::Value = serde_json::from_str(VERDICT_FIXTURE).unwrap();
     doc["future_counter"] = serde_json::json!(1);
     let v2: ShardVerdict = serde_json::from_str(&doc.to_string()).expect("extra field tolerated");
     assert_eq!(v2.shard_index, 0);
+}
+
+#[test]
+fn compression_and_outcome_strings_agree_across_serde_display_and_fromstr() {
+    for c in [CellCompression::Gzip, CellCompression::Uncompressed] {
+        assert_eq!(c.to_string().parse::<CellCompression>().unwrap(), c);
+        assert_eq!(
+            serde_json::to_value(c).unwrap(),
+            serde_json::json!(c.to_string())
+        );
+    }
+    assert!("zstd".parse::<CellCompression>().is_err());
+    for o in [Outcome::Complete, Outcome::Failed] {
+        assert_eq!(
+            serde_json::to_value(&o).unwrap(),
+            serde_json::json!(o.to_string())
+        );
+    }
 }

@@ -1,6 +1,6 @@
 //! The SQL `prepare` runs, each builder beside the decoder of its result so
-//! a query's column order and the code reading it stay together. Ports of
-//! the Python launcher's builders. Pure: no I/O.
+//! a query's column order and the code reading it stay together. Matches the
+//! reference implementation's SQL. Pure: no I/O.
 
 use crate::bqjobs::{Field, QueryResult};
 use crate::error::{Error, Result};
@@ -8,7 +8,8 @@ use crate::source::TableRef;
 
 use super::boundaries::MAX_BUCKETS;
 
-/// BigQuery's maximum unresolved GoogleSQL query length.
+/// BigQuery's limit is 1,024K characters of unresolved query; 1,000,000 bytes
+/// is deliberately under it.
 const MAX_QUERY_BYTES: usize = 1_000_000;
 
 pub const KEY: &str = "key";
@@ -26,6 +27,7 @@ pub fn string_literal(s: &str) -> String {
             '\n' => out.push_str(r"\n"),
             '\r' => out.push_str(r"\r"),
             '\t' => out.push_str(r"\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -33,6 +35,7 @@ pub fn string_literal(s: &str) -> String {
     out
 }
 
+/// With `null_json_deletes_row` a NULL json is a row delete and must be kept.
 pub fn row_filter(null_json_deletes_row: bool) -> &'static str {
     if null_json_deletes_row {
         "WHERE key IS NOT NULL"
@@ -56,6 +59,12 @@ pub fn check_schema(schema: &[Field]) -> Result<()> {
                     "the query has no {name} column; freighter needs `{KEY} STRING, {JSON} STRING`"
                 )))
             }
+            Some(f) if f.mode.as_deref() == Some("REPEATED") => {
+                return Err(Error::Refused(format!(
+                    "column {name} is an ARRAY<{}>; freighter needs a scalar STRING",
+                    f.field_type
+                )))
+            }
             Some(f) if f.field_type != "STRING" => {
                 return Err(Error::Refused(format!(
                 "column {name} is {}, not STRING; cast it in the query (TO_JSON_STRING for JSON)",
@@ -68,6 +77,9 @@ pub fn check_schema(schema: &[Field]) -> Result<()> {
     Ok(())
 }
 
+/// `APPROX_QUANTILES(key, n)` yields n+1 cuts including the min and max;
+/// `MIN(key)` is exact and is NULL when the filtered target is empty, which
+/// is how emptiness is detected.
 pub fn quantiles(target_sql: &str, buckets: u32, null_json_deletes_row: bool) -> String {
     format!(
         "SELECT APPROX_QUANTILES(key, {buckets}) AS cuts, MIN(key) AS lowest,\n       COUNT(*) AS row_count\nFROM ({target_sql})\n{}\n",
@@ -99,8 +111,11 @@ pub fn decode_quantiles(r: &QueryResult) -> Result<Option<Quantiles>> {
     }))
 }
 
-/// The CREATE TABLE AS SELECT. `buckets` is `boundaries.len() + 1`;
+/// The CREATE TABLE AS SELECT; there are `boundaries.len() + 1` buckets and
 /// `expires_days == 0` means no expiration.
+///
+/// `CREATE TABLE`, never `OR REPLACE`: `prepare` refuses an existing table
+/// before the scan, and a rebuild is the user's deliberate drop.
 ///
 /// Three orderings have to agree for a bucket to be one contiguous run of
 /// row keys: BigQuery compares STRINGs by Unicode code point, the mover
@@ -112,10 +127,12 @@ pub fn ctas(
     table: &TableRef,
     target_sql: &str,
     boundaries: &[String],
-    buckets: u32,
     expires_days: u32,
     null_json_deletes_row: bool,
 ) -> Result<String> {
+    let buckets = u32::try_from(boundaries.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
     if buckets > MAX_BUCKETS {
         return Err(Error::Refused(format!(
             "{buckets} buckets exceeds the {MAX_BUCKETS} partitions one CREATE TABLE AS job may write"
@@ -150,12 +167,16 @@ pub fn ctas(
 /// Up to `samples` bucket numbers spread evenly over `0..buckets`, always
 /// including bucket 0.
 pub fn sample_buckets(buckets: u32, samples: u32) -> Vec<u32> {
-    let mut out: Vec<u32> = (0..samples).map(|i| i * buckets / samples).collect();
+    let mut out: Vec<u32> = (0..samples)
+        .map(|i| (u64::from(i) * u64::from(buckets) / u64::from(samples)) as u32)
+        .collect();
     out.sort_unstable();
     out.dedup();
     out
 }
 
+/// One `LIMIT` per bucket so each arm prunes to one partition; its rows are
+/// measured in `prepare.rs`, beside the size arithmetic.
 pub fn sample(table: &TableRef, buckets: &[u32], rows_per_bucket: u32) -> String {
     buckets
         .iter()
@@ -169,6 +190,7 @@ pub fn sample(table: &TableRef, buckets: &[u32], rows_per_bucket: u32) -> String
         .join("\nUNION ALL\n")
 }
 
+/// The largest bucket, not the mean, sizes a shard.
 pub fn max_bucket_rows(table: &TableRef) -> String {
     format!(
         "SELECT MAX(n) AS max_rows FROM (SELECT COUNT(*) AS n FROM {} GROUP BY {BUCKET})",
@@ -204,6 +226,7 @@ mod tests {
                 .map(|(n, t)| Field {
                     name: (*n).into(),
                     field_type: (*t).into(),
+                    mode: None,
                 })
                 .collect(),
             rows,
@@ -216,6 +239,9 @@ mod tests {
         assert_eq!(string_literal("p/t/it's"), r"'p/t/it\'s'");
         assert_eq!(string_literal(r"a\b"), r"'a\\b'");
         assert_eq!(string_literal("a\nb"), r"'a\nb'");
+        assert_eq!(string_literal("a\rb"), r"'a\rb'");
+        assert_eq!(string_literal("a\tb"), r"'a\tb'");
+        assert_eq!(string_literal("a\u{0}b"), r"'a\u0000b'");
         assert_eq!(string_literal(""), "''");
     }
 
@@ -235,6 +261,10 @@ mod tests {
         );
         let int_key = result(&[("key", "INTEGER"), ("json", "STRING")], vec![]);
         assert!(check_schema(&int_key.schema).is_err());
+        let mut array_key = result(&[("key", "STRING"), ("json", "STRING")], vec![]);
+        array_key.schema[0].mode = Some("REPEATED".into());
+        let err = check_schema(&array_key.schema).unwrap_err();
+        assert!(err.to_string().contains("ARRAY"), "{err}");
         let missing = result(&[("key", "STRING")], vec![]);
         let err = check_schema(&missing.schema).unwrap_err();
         assert!(err.to_string().contains("json"), "{err}");
@@ -243,6 +273,10 @@ mod tests {
 
     #[test]
     fn quantiles_cut_over_the_filtered_target() {
+        assert_eq!(
+            quantiles("SELECT key, json FROM `p`.`d`.`t`", 64, false),
+            "SELECT APPROX_QUANTILES(key, 64) AS cuts, MIN(key) AS lowest,\n       COUNT(*) AS row_count\nFROM (SELECT key, json FROM `p`.`d`.`t`)\nWHERE key IS NOT NULL AND json IS NOT NULL\n"
+        );
         let sql = quantiles(TARGET, 64, false);
         assert!(sql.contains("APPROX_QUANTILES(key, 64) AS cuts"));
         assert!(sql.contains("MIN(key) AS lowest"));
@@ -294,11 +328,22 @@ mod tests {
             &table(),
             TARGET,
             &["p/t/3".to_owned(), "p/t/it's".to_owned()],
-            3,
             7,
             false,
         )
         .unwrap();
+        let golden = ctas(
+            &table(),
+            "SELECT key, json FROM `p`.`d`.`t`",
+            &["b".to_owned(), "m".to_owned()],
+            7,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            golden,
+            "CREATE TABLE `example-project`.`scratch`.`lookup_src`\nPARTITION BY RANGE_BUCKET(bucket, GENERATE_ARRAY(0, 3, 1))\nCLUSTER BY key\nOPTIONS (\n  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)\n)\nAS\nSELECT key, json, RANGE_BUCKET(key, ARRAY<STRING>['b', 'm']) AS bucket\nFROM (SELECT key, json FROM `p`.`d`.`t`)\nWHERE key IS NOT NULL AND json IS NOT NULL\n"
+        );
         assert!(sql.contains("CREATE TABLE `example-project`.`scratch`.`lookup_src`"));
         assert!(sql.contains("PARTITION BY RANGE_BUCKET(bucket, GENERATE_ARRAY(0, 3, 1))"));
         assert!(sql.contains("CLUSTER BY key"));
@@ -308,7 +353,7 @@ mod tests {
         assert!(sql.contains(&format!("FROM ({TARGET})")));
         assert!(sql.contains("UNION ALL"));
         assert!(sql.contains("WHERE key IS NOT NULL AND json IS NOT NULL"));
-        let forever = ctas(&table(), TARGET, &[], 1, 0, true).unwrap();
+        let forever = ctas(&table(), TARGET, &[], 0, true).unwrap();
         assert!(!forever.contains("expiration_timestamp"));
         assert!(!forever.contains("OPTIONS"));
         assert!(forever.contains("ARRAY<STRING>[]"));
@@ -318,11 +363,12 @@ mod tests {
 
     #[test]
     fn ctas_refuses_the_partition_ceiling_plus_one_and_a_megabyte_statement() {
-        assert!(ctas(&table(), TARGET, &[], 4000, 7, false).is_ok());
-        let err = ctas(&table(), TARGET, &[], 4001, 7, false).unwrap_err();
+        let keys = |n: usize| -> Vec<String> { (0..n).map(|i| format!("{i:05}")).collect() };
+        assert!(ctas(&table(), TARGET, &keys(3999), 7, false).is_ok());
+        let err = ctas(&table(), TARGET, &keys(4000), 7, false).unwrap_err();
         assert!(err.to_string().contains("4001"), "{err}");
-        let long_keys: Vec<String> = (0..4000).map(|i| format!("{i:0>300}")).collect();
-        let err = ctas(&table(), TARGET, &long_keys, 4000, 7, false).unwrap_err();
+        let long_keys: Vec<String> = (0..3999).map(|i| format!("{i:0>300}")).collect();
+        let err = ctas(&table(), TARGET, &long_keys, 7, false).unwrap_err();
         assert!(err.to_string().contains("--buckets"), "{err}");
         assert!(matches!(err, Error::Refused(_)));
     }

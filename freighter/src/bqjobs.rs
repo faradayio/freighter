@@ -29,6 +29,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Field {
     pub name: String,
     pub field_type: String,
+    /// NULLABLE, REQUIRED or REPEATED; absent on some responses.
+    pub mode: Option<String>,
 }
 
 /// One result cell. BigQuery's JSON API renders every scalar as a string
@@ -134,6 +136,7 @@ struct WireField {
     name: String,
     #[serde(rename = "type")]
     field_type: String,
+    mode: Option<String>,
 }
 #[derive(Deserialize)]
 struct WireSchema {
@@ -250,6 +253,7 @@ fn fields(schema: Option<WireSchema>) -> Vec<Field> {
                 .map(|f| Field {
                     name: f.name,
                     field_type: f.field_type,
+                    mode: f.mode,
                 })
                 .collect()
         })
@@ -591,7 +595,8 @@ mod tests {
             page.schema[2],
             Field {
                 name: "row_count".into(),
-                field_type: "INTEGER".into()
+                field_type: "INTEGER".into(),
+                mode: Some("NULLABLE".into())
             }
         );
         assert_eq!(page.rows[0].strs(0).unwrap(), vec!["a", "b"]);
@@ -634,6 +639,7 @@ mod tests {
         let t = decode_table(doc.as_bytes()).unwrap();
         assert_eq!((t.num_rows, t.num_bytes), (1_500_000, 618_900_000));
         assert_eq!(t.schema[0].field_type, "STRING");
+        assert!(t.schema[0].mode.is_none());
         let rp = t.range_partitioning.unwrap();
         assert_eq!(
             (rp.field.as_str(), rp.start, rp.end, rp.interval),

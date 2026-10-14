@@ -24,7 +24,7 @@ pub const MIN_ROWS_PER_BUCKET: u64 = 50_000;
 /// equal size.
 ///
 /// Rounding is half-to-even (`round_ties_even`), Python's `round`: the
-/// Python launcher this ports picks the same cuts for the same input.
+/// reference implementation this ports picks the same cuts for the same input.
 pub fn shard_boundaries(cuts: &[String], lowest: &str, rows: u64) -> Vec<String> {
     let interior: &[String] = cuts
         .get(1..cuts.len().saturating_sub(1))

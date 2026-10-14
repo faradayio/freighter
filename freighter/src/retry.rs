@@ -59,10 +59,14 @@ pub fn retryable_code(code: i32) -> bool {
     retryable(tonic::Code::from(code))
 }
 
-/// [`retryable`] for the BigQuery REST API: 5xx and 429 are transient, and
+/// The REST counterpart of [`retryable`]: 5xx and 429 are transient, and
 /// so is a 403 whose error reason is `rateLimitExceeded` — BigQuery signals
 /// rate limits as either status. Plain integers and strings, so the policy
 /// lives here without naming an HTTP client.
+///
+/// `jobBackendError` / `jobInternalError` / `jobRateLimitExceeded` (400) are
+/// deliberately not here: BigQuery says to retry those with a NEW job id, and
+/// re-sending the same `requestId` would only return the same failed job.
 pub fn retryable_http(status: u16, reason: Option<&str>) -> bool {
     status >= 500 || status == 429 || (status == 403 && reason == Some("rateLimitExceeded"))
 }
@@ -251,11 +255,12 @@ mod tests {
     }
 
     #[test]
-    fn retryable_http_covers_server_errors_and_both_rate_limit_spellings() {
+    fn retryable_http_covers_server_errors_and_both_rate_limit_statuses() {
         for status in [500u16, 502, 503, 504, 429] {
             assert!(retryable_http(status, None), "{status} must be retryable");
         }
         assert!(retryable_http(403, Some("rateLimitExceeded")));
+        assert!(retryable_http(429, Some("rateLimitExceeded")));
         assert!(!retryable_http(403, Some("accessDenied")));
         assert!(!retryable_http(403, None));
         for status in [400u16, 401, 404, 409, 200] {

@@ -12,4 +12,5 @@ pub mod lookup;
 pub mod manifest;
 pub mod pipeline;
 pub mod retry;
+pub mod source;
 pub mod write;

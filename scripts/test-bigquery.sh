@@ -20,6 +20,11 @@ if ! command -v cbt >/dev/null 2>&1; then
   echo "ERROR: cbt CLI missing — run: gcloud components install cbt" >&2
   exit 1
 fi
+gcloud auth application-default print-access-token >/dev/null 2>&1 || {
+  echo "ERROR: no Application Default Credentials — run: gcloud auth application-default login" >&2
+  exit 1
+}
 
-# --test-threads=1: the end-to-end test is one sequential story.
+# --test-threads=1: serial, so the echoed freighter stderr of the end-to-end
+# story does not interleave with the jobs tests.
 cargo test -p bq-freighter --test bigquery -- --test-threads=1 "$@"

@@ -16,7 +16,7 @@ async fn prepare_plan_move_verify() {
     let sharded = support::unique_table("sharded");
     eprintln!("synthetic table: {synthetic}\nsharded table: {sharded}");
     // The emulator outlives a run, so the Bigtable table is per-run too.
-    let bt_table = format!("e2e_{}", std::process::id());
+    let bt_table = format!("e2e_{}", support::unique_suffix());
     let dir = std::env::temp_dir().join(format!("freighter-e2e-{}", std::process::id()));
 
     jobs.query(&project, &support::synthetic_ddl(&synthetic))
@@ -29,7 +29,7 @@ async fn prepare_plan_move_verify() {
         let source_path = dir.join("source.json");
 
         // ---- prepare ----
-        let out = support::run_freighter(&[
+        support::run_freighter_ok(&[
             "prepare",
             "--query",
             &target,
@@ -42,7 +42,6 @@ async fn prepare_plan_move_verify() {
             "--out",
             source_path.to_str().unwrap(),
         ]);
-        assert_eq!(out.status.code(), Some(0));
         let source =
             SourceRecord::from_json(&std::fs::read_to_string(&source_path).unwrap()).unwrap();
         assert_eq!(source.rows, 1_500_000);
@@ -160,7 +159,7 @@ async fn prepare_plan_move_verify() {
 
         // ---- plan ----
         let out_dir = dir.join("load");
-        let out = support::run_freighter(&[
+        support::run_freighter_ok(&[
             "plan",
             "--source",
             source_path.to_str().unwrap(),
@@ -179,7 +178,6 @@ async fn prepare_plan_move_verify() {
             "--out-dir",
             out_dir.to_str().unwrap(),
         ]);
-        assert_eq!(out.status.code(), Some(0));
         let manifest_path = out_dir.join("manifest.json");
         let manifest =
             MoveManifest::from_json(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -188,14 +186,16 @@ async fn prepare_plan_move_verify() {
         // ---- move (into the emulator) ----
         support::create_bt_table(&bt_table);
         let uri = format!("file://{}", manifest_path.display());
-        let out = support::run_freighter(&["move", &uri]);
-        assert_eq!(out.status.code(), Some(0));
+        support::run_freighter_ok(&["move", &uri]);
 
         // ---- verify ----
         let report_path = dir.join("report.json");
         let out = support::run_freighter(&["verify", &uri, "--out", report_path.to_str().unwrap()]);
-        let report: VerifyReport =
-            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let report: VerifyReport = serde_json::from_str(
+            &std::fs::read_to_string(&report_path)
+                .unwrap_or_else(|e| panic!("verify wrote no report ({e}); exit {:?}", out.status)),
+        )
+        .unwrap();
         assert!(report.ok, "{report:?}");
         assert_eq!(out.status.code(), Some(0));
         assert_eq!(report.shards, manifest.shards.len());

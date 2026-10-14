@@ -343,6 +343,12 @@ impl CallError {
             _ => None,
         }
     }
+    pub(crate) fn reason(&self) -> Option<&str> {
+        match self {
+            CallError::Status { reason, .. } => reason.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for CallError {
@@ -550,7 +556,7 @@ impl BqJobs {
         })
     }
 
-    /// `tables.get`; a 404 is `None`.
+    /// `tables.get`; a `notFound` 404 is `None`.
     pub async fn table(&self, t: &TableRef) -> Result<Option<TableInfo>> {
         let url = endpoint(
             &[
@@ -561,7 +567,9 @@ impl BqJobs {
         let label = format!("bq table={t}");
         match self.call("tables.get", &label, &Call::Get { url }).await {
             Ok(bytes) => Ok(Some(decode_table(&bytes)?)),
-            Err(e) if e.status() == Some(404) => Ok(None),
+            // Only BigQuery's own notFound: a 404 from a wrong path (an HTML
+            // page, no reason) is an error, never "the table is absent".
+            Err(e) if e.status() == Some(404) && e.reason() == Some("notFound") => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -669,6 +677,10 @@ mod tests {
         assert!(!e.is_retryable());
         assert_eq!(e.status(), Some(404));
         assert!(e.to_string().contains("notFound"));
+        assert_eq!(e.reason(), Some("notFound"));
+        assert!(error_from_body(404, b"<html>Not Found</html>")
+            .reason()
+            .is_none());
         let e = error_from_body(503, b"<html>bad gateway</html>");
         assert!(e.is_retryable());
         assert!(e.to_string().starts_with("503"));

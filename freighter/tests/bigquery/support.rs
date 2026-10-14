@@ -27,18 +27,26 @@ pub fn require_emulator() -> String {
     }
 }
 
-/// A table name no other run collides with.
-pub fn unique_table(prefix: &str) -> TableRef {
+/// `<nanos>_<counter>`: no other run, or other call in this run, collides.
+pub fn unique_suffix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let (project, dataset) = dataset();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    format!("{project}.{dataset}.freighter_test_{prefix}_{nanos}_{n}")
-        .parse()
-        .unwrap()
+    format!("{nanos}_{n}")
+}
+
+/// A BigQuery table name no other run collides with.
+pub fn unique_table(prefix: &str) -> TableRef {
+    let (project, dataset) = dataset();
+    format!(
+        "{project}.{dataset}.freighter_test_{prefix}_{}",
+        unique_suffix()
+    )
+    .parse()
+    .unwrap()
 }
 
 /// The synthetic target: 1,000,000 distinct keys; a third of the rows share
@@ -89,6 +97,13 @@ pub fn run_freighter(args: &[&str]) -> Output {
         args.join(" "),
         String::from_utf8_lossy(&out.stderr)
     );
+    out
+}
+
+/// `run_freighter`, asserting it exits 0.
+pub fn run_freighter_ok(args: &[&str]) -> Output {
+    let out = run_freighter(args);
+    assert_eq!(out.status.code(), Some(0), "freighter {} failed", args[0]);
     out
 }
 

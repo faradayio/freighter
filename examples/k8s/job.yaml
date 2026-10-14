@@ -32,7 +32,7 @@ spec:
       containers:
         - name: freighter
           image: ghcr.io/faradayio/freighter:v0.2.0
-          # `freighter <uri>` runs the manifest; `["move", "<uri>"]` is the documented spelling.
+          # The bare manifest URI runs `move`; `freighter move <uri>` is the documented spelling.
           args: ["gs://my-bucket/loads/2026-10-14/manifest.json"]
           env:
             - { name: RUST_LOG, value: info }

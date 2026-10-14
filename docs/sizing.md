@@ -180,9 +180,9 @@ freighter plan ... --cell-timestamp-micros 1792003349318000 --out-dir load-rerun
 ```
 
 The value is microseconds since the epoch and a whole number of
-milliseconds, as in the manifest. Anything else is refused with exit 2 before
-a manifest is written. That includes a timestamp in seconds or milliseconds,
-which would stamp every cell in 1970:
+milliseconds, as in the manifest. A value in the wrong unit (seconds or
+milliseconds) is refused at the flag with exit 2; the mover applies the same
+rule to the manifest. Nothing is written:
 
 ```
 error: invalid value '1792003349' for '--cell-timestamp-micros <CELL_TIMESTAMP_MICROS>': cell timestamp 1792003349 is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20); seconds or milliseconds would stamp cells in 1970

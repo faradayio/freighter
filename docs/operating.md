@@ -83,6 +83,9 @@ jq .cell_timestamp_micros load/step-0/manifest.json
 freighter plan ... --cell-timestamp-micros <that value> --out-dir load-2
 ```
 
+A value in the wrong unit (seconds or milliseconds) is refused at the flag
+with exit 2; the mover applies the same rule to the manifest.
+
 ## Stopping a load
 
 The mover has no stop file or stop command. To stop it, stop the process:

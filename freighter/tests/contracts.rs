@@ -114,3 +114,29 @@ fn table_ref_parses_both_spellings() {
     assert!(TableRef::from_path("projects/p/datasets/a.b/tables/t").is_err());
     assert!(TableRef::from_path("projects/example.com:proj/datasets/d/tables/t").is_ok());
 }
+
+#[test]
+fn verify_report_serializes_to_its_fixture() {
+    use freighter::verify::{Problem, VerifyReport, VERIFY_REPORT_VERSION};
+    const REPORT_FIXTURE: &str = include_str!("../fixtures/freighter-verify-report-example.json");
+    let report = VerifyReport {
+        version: VERIFY_REPORT_VERSION,
+        ok: false,
+        shards: 200,
+        problems: vec![
+            Problem {
+                shard: 4,
+                reason: "no verdict".into(),
+            },
+            Problem {
+                shard: 7,
+                reason: "acknowledged 149 cells, source has 150 rows to set".into(),
+            },
+        ],
+        stray_verdicts: vec![9],
+    };
+    let fixture: serde_json::Value = serde_json::from_str(REPORT_FIXTURE).unwrap();
+    assert_eq!(serde_json::to_value(&report).unwrap(), fixture);
+    let back: VerifyReport = serde_json::from_str(REPORT_FIXTURE).unwrap();
+    assert_eq!(back, report);
+}

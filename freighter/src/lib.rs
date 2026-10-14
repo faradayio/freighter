@@ -16,4 +16,5 @@ pub mod plan;
 pub mod prepare;
 pub mod retry;
 pub mod source;
+pub mod verify;
 pub mod write;

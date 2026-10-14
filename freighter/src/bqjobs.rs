@@ -3,7 +3,7 @@
 //! only module naming `reqwest` or the REST endpoints. `prepare` and
 //! `verify` use it; the mover never does (it only speaks Storage Read).
 //!
-//! Three endpoints of `bigquery/v2`: `POST projects/{p}/jobs/query`,
+//! Three endpoints of `bigquery/v2`: `POST projects/{p}/queries` (jobs.query),
 //! `GET projects/{p}/queries/{jobId}` (poll + page), and
 //! `GET projects/{p}/datasets/{d}/tables/{t}`.
 
@@ -416,6 +416,12 @@ fn endpoint(segments: &[&str], query: &[(&str, &str)]) -> Result<reqwest::Url> {
     Ok(url)
 }
 
+/// jobs.query is `POST projects/{p}/queries`; there is no `jobs/query` path
+/// (the live server answers it with an HTML 404).
+fn query_endpoint(billing_project: &str) -> Result<reqwest::Url> {
+    endpoint(&["projects", billing_project, "queries"], &[])
+}
+
 /// The jobs client: one HTTP client and the ADC token provider (the same
 /// chain the mover's Storage Read and Bigtable clients use).
 #[derive(Clone)]
@@ -489,7 +495,7 @@ impl BqJobs {
             "requestId": request_id,
         }))
         .map_err(|e| Error::BqJob(format!("request body: {e}")))?;
-        let url = endpoint(&["projects", billing_project, "jobs", "query"], &[])?;
+        let url = query_endpoint(billing_project)?;
         let first = self
             .call("jobs.query", &label, &Call::Post { url, body: &body })
             .await?;
@@ -701,5 +707,9 @@ mod tests {
         assert_eq!(u.as_str(), "https://bigquery.googleapis.com/bigquery/v2/projects/p/queries/job_1?timeoutMs=10000&location=US");
         let u = endpoint(&["projects", "a b/c"], &[]).unwrap();
         assert!(u.as_str().ends_with("/projects/a%20b%2Fc"));
+        assert_eq!(
+            query_endpoint("p").unwrap().as_str(),
+            "https://bigquery.googleapis.com/bigquery/v2/projects/p/queries"
+        );
     }
 }

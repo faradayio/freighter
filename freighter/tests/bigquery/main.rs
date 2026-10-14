@@ -6,3 +6,7 @@
 //! `cargo clippy --all-targets` does NOT reach this target (`test = false`);
 //! `scripts/check.sh` lints it by name.
 #![allow(clippy::unwrap_used)]
+
+mod end_to_end;
+mod jobs;
+mod support;

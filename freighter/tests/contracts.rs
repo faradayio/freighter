@@ -113,6 +113,15 @@ fn table_ref_parses_both_spellings() {
     assert!(r"p.d.t\x".parse::<TableRef>().is_err());
     assert!(TableRef::from_path("projects/p/datasets/a.b/tables/t").is_err());
     assert!(TableRef::from_path("projects/example.com:proj/datasets/d/tables/t").is_ok());
+    // The url crate drops `.` and `..` path segments; a project may hold dots.
+    assert!(TableRef::from_path("projects/./datasets/d/tables/t").is_err());
+    assert!(TableRef::from_path("projects/../datasets/d/tables/t").is_err());
+    assert!(freighter::source::billing_project("..").is_err());
+    assert!(freighter::source::billing_project("").is_err());
+    assert_eq!(
+        freighter::source::billing_project("example.com:proj").unwrap(),
+        "example.com:proj"
+    );
 }
 
 #[test]

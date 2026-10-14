@@ -46,7 +46,7 @@ pub fn row_filter(null_json_deletes_row: bool) -> &'static str {
 
 /// `LIMIT 0` bills nothing and returns the column types.
 pub fn schema_probe(target_sql: &str) -> String {
-    format!("SELECT key, json FROM ({target_sql}) LIMIT 0")
+    format!("SELECT key, json FROM (\n{target_sql}\n) LIMIT 0")
 }
 
 /// Both columns present and `STRING`. A native `JSON` column or an `INT64`
@@ -82,7 +82,7 @@ pub fn check_schema(schema: &[Field]) -> Result<()> {
 /// is how emptiness is detected.
 pub fn quantiles(target_sql: &str, buckets: u32, null_json_deletes_row: bool) -> String {
     format!(
-        "SELECT APPROX_QUANTILES(key, {buckets}) AS cuts, MIN(key) AS lowest,\n       COUNT(*) AS row_count\nFROM ({target_sql})\n{}\n",
+        "SELECT APPROX_QUANTILES(key, {buckets}) AS cuts, MIN(key) AS lowest,\n       COUNT(*) AS row_count\nFROM (\n{target_sql}\n)\n{}\n",
         row_filter(null_json_deletes_row)
     )
 }
@@ -151,7 +151,7 @@ pub fn ctas(
         )
     };
     let sql = format!(
-        "CREATE TABLE {}\nPARTITION BY RANGE_BUCKET({BUCKET}, GENERATE_ARRAY(0, {buckets}, 1))\nCLUSTER BY {KEY}\n{options}AS\nSELECT {KEY}, {JSON}, RANGE_BUCKET({KEY}, ARRAY<STRING>[{literals}]) AS {BUCKET}\nFROM ({target_sql})\n{}\n",
+        "CREATE TABLE {}\nPARTITION BY RANGE_BUCKET({BUCKET}, GENERATE_ARRAY(0, {buckets}, 1))\nCLUSTER BY {KEY}\n{options}AS\nSELECT {KEY}, {JSON}, RANGE_BUCKET({KEY}, ARRAY<STRING>[{literals}]) AS {BUCKET}\nFROM (\n{target_sql}\n)\n{}\n",
         table.sql(),
         row_filter(null_json_deletes_row)
     );
@@ -249,7 +249,7 @@ mod tests {
     fn the_schema_probe_bills_nothing_and_checks_both_columns() {
         assert_eq!(
             schema_probe(TARGET),
-            format!("SELECT key, json FROM ({TARGET}) LIMIT 0")
+            format!("SELECT key, json FROM (\n{TARGET}\n) LIMIT 0")
         );
         let ok = result(&[("key", "STRING"), ("json", "STRING")], vec![]);
         check_schema(&ok.schema).unwrap();
@@ -275,17 +275,29 @@ mod tests {
     fn quantiles_cut_over_the_filtered_target() {
         assert_eq!(
             quantiles("SELECT key, json FROM `p`.`d`.`t`", 64, false),
-            "SELECT APPROX_QUANTILES(key, 64) AS cuts, MIN(key) AS lowest,\n       COUNT(*) AS row_count\nFROM (SELECT key, json FROM `p`.`d`.`t`)\nWHERE key IS NOT NULL AND json IS NOT NULL\n"
+            "SELECT APPROX_QUANTILES(key, 64) AS cuts, MIN(key) AS lowest,\n       COUNT(*) AS row_count\nFROM (\nSELECT key, json FROM `p`.`d`.`t`\n)\nWHERE key IS NOT NULL AND json IS NOT NULL\n"
         );
         let sql = quantiles(TARGET, 64, false);
         assert!(sql.contains("APPROX_QUANTILES(key, 64) AS cuts"));
         assert!(sql.contains("MIN(key) AS lowest"));
         assert!(sql.contains("COUNT(*) AS row_count"));
-        assert!(sql.contains(&format!("FROM ({TARGET})")));
+        assert!(sql.contains(&format!("FROM (\n{TARGET}\n)")));
         assert!(sql.contains("WHERE key IS NOT NULL AND json IS NOT NULL"));
         let deleting = quantiles(TARGET, 64, true);
         assert!(deleting.contains("WHERE key IS NOT NULL\n"));
         assert!(!deleting.contains("json IS NOT NULL"));
+    }
+
+    #[test]
+    fn a_target_ending_in_a_comment_cannot_swallow_the_closing_paren() {
+        let commented = "SELECT key, json FROM `p`.`d`.`t` -- note";
+        for sql in [
+            schema_probe(commented),
+            quantiles(commented, 64, false),
+            ctas(&table(), commented, &[], 7, false).unwrap(),
+        ] {
+            assert!(sql.contains("-- note\n)"), "{sql}");
+        }
     }
 
     #[test]
@@ -342,7 +354,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             golden,
-            "CREATE TABLE `example-project`.`scratch`.`lookup_src`\nPARTITION BY RANGE_BUCKET(bucket, GENERATE_ARRAY(0, 3, 1))\nCLUSTER BY key\nOPTIONS (\n  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)\n)\nAS\nSELECT key, json, RANGE_BUCKET(key, ARRAY<STRING>['b', 'm']) AS bucket\nFROM (SELECT key, json FROM `p`.`d`.`t`)\nWHERE key IS NOT NULL AND json IS NOT NULL\n"
+            "CREATE TABLE `example-project`.`scratch`.`lookup_src`\nPARTITION BY RANGE_BUCKET(bucket, GENERATE_ARRAY(0, 3, 1))\nCLUSTER BY key\nOPTIONS (\n  expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)\n)\nAS\nSELECT key, json, RANGE_BUCKET(key, ARRAY<STRING>['b', 'm']) AS bucket\nFROM (\nSELECT key, json FROM `p`.`d`.`t`\n)\nWHERE key IS NOT NULL AND json IS NOT NULL\n"
         );
         assert!(sql.contains("CREATE TABLE `example-project`.`scratch`.`lookup_src`"));
         assert!(sql.contains("PARTITION BY RANGE_BUCKET(bucket, GENERATE_ARRAY(0, 3, 1))"));
@@ -350,7 +362,7 @@ mod tests {
         assert!(sql
             .contains("expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"));
         assert!(sql.contains(r"RANGE_BUCKET(key, ARRAY<STRING>['p/t/3', 'p/t/it\'s']) AS bucket"));
-        assert!(sql.contains(&format!("FROM ({TARGET})")));
+        assert!(sql.contains(&format!("FROM (\n{TARGET}\n)")));
         assert!(sql.contains("UNION ALL"));
         assert!(sql.contains("WHERE key IS NOT NULL AND json IS NOT NULL"));
         let forever = ctas(&table(), TARGET, &[], 0, true).unwrap();

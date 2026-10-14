@@ -67,7 +67,9 @@ A metadata read, before any query.
 ### 2. Probe the column types
 
 ```sql
-SELECT key, json FROM (TARGET) LIMIT 0
+SELECT key, json FROM (
+TARGET
+) LIMIT 0
 ```
 
 This bills nothing and returns the result schema, which is how the wrong
@@ -78,7 +80,9 @@ column types are caught before a scan.
 ```sql
 SELECT APPROX_QUANTILES(key, 4000) AS cuts, MIN(key) AS lowest,
        COUNT(*) AS row_count
-FROM (TARGET)
+FROM (
+TARGET
+)
 WHERE key IS NOT NULL AND json IS NOT NULL
 ```
 
@@ -116,7 +120,9 @@ OPTIONS (
 )
 AS
 SELECT key, json, RANGE_BUCKET(key, ARRAY<STRING>['boundary 1', 'boundary 2', ...]) AS bucket
-FROM (TARGET)
+FROM (
+TARGET
+)
 WHERE key IS NOT NULL AND json IS NOT NULL
 ```
 

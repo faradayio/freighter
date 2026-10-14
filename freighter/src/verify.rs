@@ -180,6 +180,17 @@ pub(crate) async fn read_verdicts(store: &Arc<dyn ObjectStore>) -> Result<Vec<Sh
         verdicts.push(v);
     }
     verdicts.sort_by_key(|v| v.shard_index);
+    // `shard_4.json` and `shard_0004.json` both name shard 4; judging either
+    // alone would hide the other.
+    if let Some(w) = verdicts
+        .windows(2)
+        .find(|w| w[0].shard_index == w[1].shard_index)
+    {
+        return Err(Error::Storage(format!(
+            "two verdict files claim shard {}",
+            w[0].shard_index
+        )));
+    }
     Ok(verdicts)
 }
 
@@ -453,6 +464,13 @@ mod tests {
         std::fs::write(dir.join("shard_0007.json"), fixture).unwrap(); // content says 0, name says 7
         let err = read_verdicts(&store).await.unwrap_err();
         assert!(err.to_string().contains("disagree"), "{err}");
+        std::fs::remove_file(dir.join("shard_0007.json")).unwrap();
+        std::fs::write(dir.join("shard_0.json"), fixture).unwrap(); // a second file for shard 0
+        let err = read_verdicts(&store).await.unwrap_err();
+        assert!(
+            err.to_string().contains("two verdict files claim shard 0"),
+            "{err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

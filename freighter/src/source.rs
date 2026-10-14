@@ -21,15 +21,27 @@ pub struct TableRef {
     pub table: String,
 }
 
-fn plain_identifier(part: &str, what: &str, allow_dot: bool) -> Result<()> {
-    let bad =
-        part.is_empty() || part.contains(['`', '\\', '/']) || (!allow_dot && part.contains('.'));
+/// A part safe to quote in SQL and to push as a REST path segment. `.` and
+/// `..` are refused even where dots are allowed: the url crate drops those
+/// segments silently, and the call would address another resource.
+pub fn plain_identifier(part: &str, what: &str, allow_dot: bool) -> Result<()> {
+    let bad = part.is_empty()
+        || part == "."
+        || part == ".."
+        || part.contains(['`', '\\', '/'])
+        || (!allow_dot && part.contains('.'));
     if bad {
         return Err(Error::Refused(format!(
             "{what} {part:?} is not a plain identifier"
         )));
     }
     Ok(())
+}
+
+/// A `--billing-project`: a project id, under the same rule as a table's.
+pub fn billing_project(s: &str) -> Result<String> {
+    plain_identifier(s, "billing project", true)?;
+    Ok(s.to_owned())
 }
 
 impl TableRef {

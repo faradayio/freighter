@@ -14,7 +14,7 @@ use freighter::plan::sizing::{parse_memory, SizingConfig, POD_READ_STREAMS};
 use freighter::plan::{Destination, PlanConfig};
 use freighter::prepare::boundaries::MAX_BUCKETS;
 use freighter::prepare::PrepareConfig;
-use freighter::source::TableRef;
+use freighter::source::{billing_project, TableRef};
 
 /// Bulk-load a BigQuery table into Bigtable in key order, with verdicts you
 /// can verify.
@@ -77,7 +77,7 @@ pub struct PrepareArgs {
     #[arg(long)]
     null_json_deletes_row: bool,
     /// Project the queries are billed to (default: the table's).
-    #[arg(long)]
+    #[arg(long, value_parser = billing_project)]
     billing_project: Option<String>,
     /// Where to write the source record (default: stdout).
     #[arg(long)]
@@ -235,7 +235,7 @@ pub struct VerifyArgs {
     /// gs:// or file:// URI of the manifest; verdicts are read beside it.
     pub manifest_uri: String,
     /// Project the count query is billed to (default: the manifest's).
-    #[arg(long)]
+    #[arg(long, value_parser = billing_project)]
     pub billing_project: Option<String>,
     /// Where to write the report (default: stdout).
     #[arg(long)]

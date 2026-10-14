@@ -445,6 +445,9 @@ pub struct BqJobs {
 }
 
 impl BqJobs {
+    /// Library users must install a rustls crypto provider first
+    /// (`rustls::crypto::ring::default_provider().install_default()`); the
+    /// binary does this in `main`. reqwest here is built without one.
     pub async fn connect() -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)

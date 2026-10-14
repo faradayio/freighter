@@ -6,6 +6,7 @@
 pub mod ramp;
 pub mod sizing;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -115,7 +116,14 @@ pub fn write_manifests(out_dir: &Path, manifests: &[MoveManifest]) -> Result<Vec
         }
         let json =
             serde_json::to_string_pretty(m).map_err(|e| Error::Plan(format!("render: {e}")))?;
-        std::fs::write(path, json).map_err(|e| io(e, path))?;
+        // create_new: a writer that raced past the check above fails here
+        // rather than overwriting.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(json.as_bytes()))
+            .map_err(|e| io(e, path))?;
     }
     Ok(paths)
 }

@@ -14,6 +14,7 @@ pub struct TableConfig {
     pub family: String,
     /// Column qualifier of the one cell, as bytes.
     pub qualifier: Vec<u8>,
+    /// How the `json` value is encoded into the cell.
     pub compression: CellCompression,
     /// The one timestamp every cell carries.
     pub cell_timestamp_micros: i64,

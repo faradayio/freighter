@@ -445,10 +445,13 @@ async fn uncompressed_cells_land_as_raw_json_under_the_configured_qualifier() {
     .await
     .expect("write_batches");
     assert_eq!(counters.cells_acknowledged(), 2);
+    assert_eq!(counters.cells_failed(), 0);
     for (key, json) in source {
         let rows = support::read_back_all(&client, &table, &[key.as_bytes().to_vec()])
             .await
             .unwrap();
+        assert_eq!(rows.len(), 1, "row {key} present");
+        assert_eq!(rows[0].cells.len(), 1, "exactly one cell in row {key}");
         let cell = &rows[0].cells[0];
         assert_eq!(cell.qualifier, b"raw".to_vec());
         assert_eq!(cell.value, json.as_bytes().to_vec());

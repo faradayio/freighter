@@ -1,6 +1,7 @@
 //! Pure decode: `(key, json)` rows -> one cell per row (family and qualifier
-//! from the manifest, value = gzip(UTF-8 json) or the bytes as they are, row
-//! key = the key string's bytes). No I/O and no clock: every cell carries the manifest's
+//! from the manifest, value = gzip(UTF-8 json) or the UTF-8 bytes unchanged,
+//! per the manifest's `compression`, row key = the key string's bytes). No
+//! I/O and no clock: every cell carries the manifest's
 //! `cell_timestamp_micros`.
 
 use std::io::Write;
@@ -23,8 +24,8 @@ pub fn lookup_selected_fields(shape: &TableConfig) -> Vec<String> {
     vec![shape.rowkey_column.clone(), JSON_COLUMN.to_owned()]
 }
 
-/// The cell value for one `json` string: gzip at the default level (the
-/// framing Java's GZIPOutputStream writes) or the bytes as they are. Shared
+/// The cell value for one `json` string: gzip at flate2's default level (the
+/// framing Java's GZIPInputStream reads) or the bytes as they are. Shared
 /// with `prepare`'s row-size sample, so the sizes it measures are exactly
 /// what the mover writes.
 pub(crate) fn encode_value(json: &[u8], compression: CellCompression) -> Result<Vec<u8>> {

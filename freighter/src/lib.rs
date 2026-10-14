@@ -12,6 +12,7 @@ pub mod lanes;
 pub mod lookup;
 pub mod manifest;
 pub mod pipeline;
+pub mod plan;
 pub mod prepare;
 pub mod retry;
 pub mod source;

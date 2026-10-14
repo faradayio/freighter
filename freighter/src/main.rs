@@ -81,17 +81,20 @@ fn exit_code(e: &Error) -> i32 {
 
 /// The manifest document from a URI, through the store rooted at its
 /// directory (verdicts land and are read there).
-async fn fetch_manifest(uri: &str) -> Result<(Arc<dyn ObjectStore>, MoveManifest), (i32, String)> {
-    let (store, name) = store_for(uri).map_err(|e| (2, e))?;
+///
+/// Every failure here is 2, as in v0.1: a manifest that cannot be fetched is
+/// the caller's to fix, and a Job's restart policy should not retry it.
+async fn fetch_manifest(uri: &str) -> Result<(Arc<dyn ObjectStore>, MoveManifest), String> {
+    let (store, name) = store_for(uri)?;
     let doc = store
         .get(&name)
         .await
-        .map_err(|e| (2, format!("fetch manifest {uri}: {e}")))?
+        .map_err(|e| format!("fetch manifest {uri}: {e}"))?
         .bytes()
         .await
-        .map_err(|e| (2, format!("read manifest {uri}: {e}")))?;
-    let text = std::str::from_utf8(&doc).map_err(|e| (2, e.to_string()))?;
-    let manifest = MoveManifest::from_json(text).map_err(|e| (2, e.to_string()))?;
+        .map_err(|e| format!("read manifest {uri}: {e}"))?;
+    let text = std::str::from_utf8(&doc).map_err(|e| e.to_string())?;
+    let manifest = MoveManifest::from_json(text).map_err(|e| e.to_string())?;
     Ok((store, manifest))
 }
 
@@ -115,9 +118,8 @@ fn read_local(manifest: &str) -> Result<String, String> {
 
 fn write_out(out: Option<&FsPath>, text: &str) -> Result<(), String> {
     match out {
-        Some(path) => {
-            std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
-        }
+        Some(path) => std::fs::write(path, format!("{text}\n"))
+            .map_err(|e| format!("write {}: {e}", path.display())),
         None => {
             println!("{text}");
             Ok(())
@@ -134,6 +136,15 @@ async fn run_prepare(args: cli::PrepareArgs) -> i32 {
             return exit_code(&e);
         }
     };
+    if let Some(out) = &out {
+        if !out
+            .parent()
+            .is_none_or(|p| p.as_os_str().is_empty() || p.is_dir())
+        {
+            log::error!("--out {}: its directory does not exist", out.display());
+            return 2;
+        }
+    }
     let jobs = match BqJobs::connect().await {
         Ok(j) => j,
         Err(e) => {
@@ -148,14 +159,19 @@ async fn run_prepare(args: cli::PrepareArgs) -> i32 {
             return exit_code(&e);
         }
     };
-    match record
-        .to_json()
-        .map_err(|e| e.to_string())
-        .and_then(|t| write_out(out.as_deref(), &t))
-    {
+    let text = match record.to_json() {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("{e}");
+            return 1;
+        }
+    };
+    match write_out(out.as_deref(), &text) {
         Ok(()) => 0,
         Err(e) => {
             log::error!("{e}");
+            // The record cost a full scan and a CTAS; a rerun refuses the built table, so never let a bad --out swallow it.
+            println!("{text}");
             1
         }
     }
@@ -194,9 +210,9 @@ fn run_plan(args: cli::PlanArgs) -> i32 {
 async fn run_move(manifest_uri: &str) -> i32 {
     let (store, manifest) = match fetch_manifest(manifest_uri).await {
         Ok(x) => x,
-        Err((code, e)) => {
+        Err(e) => {
             log::error!("{e}");
-            return code;
+            return 2;
         }
     };
     match freighter::pipeline::run_move(manifest, store).await {
@@ -211,9 +227,9 @@ async fn run_move(manifest_uri: &str) -> i32 {
 async fn run_verify(args: cli::VerifyArgs) -> i32 {
     let (store, manifest) = match fetch_manifest(&args.manifest_uri).await {
         Ok(x) => x,
-        Err((code, e)) => {
+        Err(e) => {
             log::error!("{e}");
-            return code;
+            return 2;
         }
     };
     let billing_project = args

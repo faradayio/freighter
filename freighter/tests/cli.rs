@@ -96,12 +96,17 @@ fn validate_reads_a_file_uri_and_refuses_gs() {
 
 #[test]
 fn the_bare_uri_form_and_move_both_parse_and_fail_at_fetch() {
-    // Both spellings reach the manifest fetch (no network: a missing local
-    // file) and exit 2 the way v0.1 did.
-    let out = freighter(&["file:///no/such/manifest.json"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    let out = freighter(&["move", "file:///no/such/manifest.json"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    // Both spellings reach the manifest fetch: the directory exists but the
+    // manifest does not, so the run fails at `store.get` and exits 2 the way
+    // v0.1 did. A clap usage error would also exit 2 but would not say
+    // "fetch manifest".
+    let dir = scratch_dir("bare");
+    let uri = format!("file://{}", dir.join("manifest.json").display());
+    for args in [vec![uri.as_str()], vec!["move", uri.as_str()]] {
+        let out = freighter(&args);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(stderr(&out).contains("fetch manifest"), "{}", stderr(&out));
+    }
 }
 
 #[test]
@@ -196,4 +201,8 @@ fn plan_runs_offline_and_its_output_validates() {
     let out = freighter(&bad);
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).contains("Gi or Mi"), "{}", stderr(&out));
+
+    let mut zero = common.to_vec();
+    zero.extend(["--read-streams", "0"]);
+    assert_eq!(freighter(&zero).status.code(), Some(2));
 }

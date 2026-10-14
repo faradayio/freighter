@@ -23,6 +23,7 @@ use freighter::source::TableRef;
     name = "freighter",
     version,
     arg_required_else_help = true,
+    override_usage = "freighter <COMMAND>",
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
@@ -66,7 +67,7 @@ pub struct PrepareArgs {
     /// project.dataset.table to create.
     #[arg(long, value_parser = parse_table)]
     table: TableRef,
-    /// Ceiling on the number of buckets; thinned to 50,000 rows a bucket.
+    /// Upper bound on the number of buckets; thinned so each holds at least 50,000 rows.
     #[arg(long, default_value_t = MAX_BUCKETS, value_parser = clap::value_parser!(u32).range(1..=MAX_BUCKETS as i64))]
     buckets: u32,
     /// Table expiration in days; 0 = never.
@@ -135,30 +136,37 @@ pub struct PlanArgs {
     /// Memory the mover process gets, as a Kubernetes quantity in Gi or Mi.
     #[arg(long, value_parser = parse_memory)]
     memory: u64,
+    /// Bigtable project.
     #[arg(long)]
     bt_project: String,
+    /// Bigtable instance.
     #[arg(long)]
     bt_instance: String,
+    /// Bigtable table; must already exist with the column family.
     #[arg(long)]
     destination_table: String,
+    /// Bigtable app profile to write through (a low-priority one lets serving reads win).
     #[arg(long)]
     app_profile: String,
+    /// Column family of the one cell.
     #[arg(long, default_value = "data")]
     family: String,
+    /// Column qualifier of the one cell.
     #[arg(long, default_value = "jsonz")]
     qualifier: String,
     /// gzip or none.
     #[arg(long, default_value = "gzip", value_parser = parse_compression)]
     compression: CellCompression,
-    /// Bytes per MutateRows request.
-    #[arg(long, default_value_t = 4_000_000)]
+    /// Target bytes per MutateRows request; sets the rows per request.
+    #[arg(long, default_value_t = 4_000_000, value_parser = clap::value_parser!(u64).range(1..))]
     target_request_bytes: u64,
     // clap's `value_parser!(usize)` has no `.range`; the ranged parser is
     // spelled out.
+    /// Ceiling on rows per MutateRows request; caps what --target-request-bytes derives.
     #[arg(long, default_value_t = MAX_FLUSH_CELLS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=MAX_FLUSH_CELLS as u64))]
     max_flush_cells: usize,
     /// Storage Read streams for the whole process, shared out per lane.
-    #[arg(long, default_value_t = POD_READ_STREAMS)]
+    #[arg(long, default_value_t = POD_READ_STREAMS, value_parser = clap::builder::RangedI64ValueParser::<i32>::new().range(1..))]
     read_streams: i32,
     /// Fractions of the shards per step, e.g. 0.05,0.10,0.85.
     #[arg(long, default_value = "1.0", value_parser = parse_ramp)]
@@ -167,6 +175,7 @@ pub struct PlanArgs {
     /// milliseconds. Pass the previous plan's value to re-run a load.
     #[arg(long)]
     cell_timestamp_micros: Option<i64>,
+    /// A fresh directory per attempt: verdicts are written beside the manifest.
     #[arg(long, default_value = ".")]
     pub out_dir: PathBuf,
 }
@@ -227,5 +236,15 @@ pub fn parse() -> Command {
         (Some(c), _) => c,
         (None, Some(manifest_uri)) => Command::Move { manifest_uri },
         (None, None) => unreachable!("arg_required_else_help exits before this"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn the_default_cell_timestamp_is_whole_milliseconds() {
+        let now = UNIX_EPOCH + std::time::Duration::from_micros(1_234_567_891);
+        assert_eq!(load_timestamp_micros(now), 1_234_567_000);
     }
 }

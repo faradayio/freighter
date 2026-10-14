@@ -23,6 +23,34 @@ pub enum Error {
     /// uses). The client reports the code; retry policy lives in retry.rs.
     #[error("bigtable rpc {code}: {message}")]
     BigtableRpc { code: i32, message: String },
+    /// A BigQuery jobs-API call that failed for a reason other than a status:
+    /// transport, token, or a result freighter could not use.
+    #[error("bq job: {0}")]
+    BqJob(String),
+    /// A BigQuery REST call answered with an error status: the HTTP code,
+    /// BigQuery's `reason` (`notFound`, `invalidQuery`, `rateLimitExceeded`, …)
+    /// and its message. Kept structured so callers classify by `reason`,
+    /// never by parsing the text.
+    #[error("bq job: {code}{}: {message}", reason.as_deref().map(|r| format!(" {r}")).unwrap_or_default())]
+    BqStatus {
+        code: u16,
+        reason: Option<String>,
+        message: String,
+    },
+    /// A source record (the `prepare` -> `plan` contract) that fails to
+    /// parse or validate.
+    #[error("source record: {0}")]
+    Source(String),
+    /// A precondition the user must fix before anything runs: the table
+    /// already exists, the query yields no rows, a flag is out of range.
+    /// `main` maps it to exit 2. Displayed bare — the message is the whole
+    /// line.
+    #[error("{0}")]
+    Refused(String),
+    /// `plan` could not render a manifest, or rendered one the mover's
+    /// validator refuses — a bug in `plan`, exit 1.
+    #[error("plan: {0}")]
+    Plan(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

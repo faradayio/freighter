@@ -5,13 +5,21 @@ use arrow_array::Array;
 use arrow_array::RecordBatch;
 
 use crate::error::{Error, Result};
-use crate::manifest::MoveManifest;
+use crate::manifest::{CellCompression, MoveManifest};
+
+/// The source column holding the cell's value: read by the decoder, written
+/// by `prepare`, counted by `verify`.
+pub(crate) const JSON_COLUMN: &str = "json";
 
 /// The per-table config the manifest declares.
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     pub rowkey_column: String,
     pub family: String,
+    /// Column qualifier of the one cell, as bytes.
+    pub qualifier: Vec<u8>,
+    /// How the `json` value is encoded into the cell.
+    pub compression: CellCompression,
     /// The one timestamp every cell carries.
     pub cell_timestamp_micros: i64,
     /// A NULL value deletes its row instead of being refused.
@@ -23,6 +31,8 @@ impl TableConfig {
         Self {
             rowkey_column: m.rowkey_column.clone(),
             family: m.family.clone(),
+            qualifier: m.qualifier.as_bytes().to_vec(),
+            compression: m.compression,
             cell_timestamp_micros: m.cell_timestamp_micros,
             null_json_deletes_row: m.null_json_deletes_row,
         }

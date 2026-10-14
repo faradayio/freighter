@@ -1,6 +1,6 @@
 [package]
 name = "bq-freighter"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 # The oldest supported compiler, a floor set by the Bigtable client's
@@ -64,7 +64,8 @@ flate2 = "1"
 # crypto backend, a second TLS stack with a C build. Without "reqwest" the GCS
 # builder has no HTTP transport and every gs:// manifest fails at startup.
 object_store = { version = "0.14", features = ["gcp-base", "ring", "reqwest"] }
-# object_store's HTTP client. reqwest's "rustls" feature would pull aws-lc;
+# HTTP client for object_store's GCS backend and for the BigQuery jobs API
+# (bqjobs.rs). reqwest's "rustls" feature would pull aws-lc;
 # rustls-no-provider plus the ring provider main.rs installs keeps one backend.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -74,6 +75,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.34"
 tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-ring"] }
 gcp_auth = "0.12"
+# Used by the binary only (cli.rs); the library's API never names clap. It
+# still compiles for library users — making it optional is not worth a
+# feature today.
+clap = { version = "4.6", features = ["derive"] }
+# requestId on every jobs.query submit, so a retried POST dedupes against the
+# job BigQuery already started instead of launching a second CTAS.
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # `test-util` unlocks `#[tokio::test(start_paused = true)]` + manual clock
@@ -88,6 +96,15 @@ tokio = { version = "1", features = ["test-util"] }
 [[test]]
 name = "emulator"
 path = "tests/emulator/main.rs"
+test = false
+
+# The BigQuery suite needs real credentials and a scratch dataset
+# (FREIGHTER_TEST_DATASET) plus the Bigtable emulator; it HARD FAILS without
+# them. `test = false` keeps it out of a bare `cargo test`; run it with
+# `scripts/test-bigquery.sh`.
+[[test]]
+name = "bigquery"
+path = "tests/bigquery/main.rs"
 test = false
 
 [lints]

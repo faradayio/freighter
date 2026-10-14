@@ -8,4 +8,5 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 # --all-targets skips the emulator target (`test = false`); lint it by name.
 cargo clippy -p bq-freighter --test emulator -- -D warnings
+cargo clippy -p bq-freighter --test bigquery -- -D warnings
 cargo test -p bq-freighter

@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)] // tests; the workspace denies unwrap_used
 
-use freighter::manifest::{MoveManifest, Outcome, ShardVerdict};
+use freighter::manifest::{CellCompression, MoveManifest, Outcome, ShardVerdict};
 
 const LOOKUP_MANIFEST_FIXTURE: &str =
     include_str!("../fixtures/freighter-lookup-manifest-example.json");
@@ -19,7 +19,7 @@ fn lookup_fixture_with(from: &str, to: &str) -> String {
 #[test]
 fn verdict_serializes_to_the_fixture() {
     let verdict = ShardVerdict {
-        manifest_version: 3,
+        manifest_version: 4,
         shard_index: 0,
         rows_read: 6_245_162,
         cells_encoded: 6_245_100,
@@ -47,14 +47,15 @@ fn verdict_serializes_to_the_fixture() {
 
 #[test]
 fn refuses_wrong_version() {
-    for wrong in [2, 4] {
-        let doc = lookup_fixture_with("\"version\": 3", &format!("\"version\": {wrong}"));
+    for wrong in [2, 5] {
+        let doc = lookup_fixture_with("\"version\": 4", &format!("\"version\": {wrong}"));
         let err = MoveManifest::from_json(&doc).unwrap_err();
         assert!(
             err.to_string()
                 .contains(&format!("version {wrong} unsupported")),
             "{err}"
         );
+        assert!(err.to_string().contains("understands 3 or 4"), "{err}");
     }
 }
 
@@ -90,10 +91,10 @@ fn refuses_empty_shards() {
 
 #[test]
 fn refuses_wrong_version_even_when_body_is_unparseable() {
-    // A future v4 manifest with changed fields must get the version
+    // A future v5 manifest with changed fields must get the version
     // message, not a serde missing-field error.
     let mut doc: serde_json::Value = serde_json::from_str(LOOKUP_MANIFEST_FIXTURE).unwrap();
-    doc["version"] = serde_json::json!(4);
+    doc["version"] = serde_json::json!(5);
     let obj = doc.as_object_mut().unwrap();
     obj.remove("shards");
     obj.remove("family");
@@ -101,10 +102,10 @@ fn refuses_wrong_version_even_when_body_is_unparseable() {
     let err = MoveManifest::from_json(&doc.to_string()).unwrap_err();
     assert!(err.to_string().contains("version"), "{err}");
     // And with ADDED fields: pins that VersionProbe itself carries no
-    // deny_unknown_fields — a v4 doc with new knobs still gets the
+    // deny_unknown_fields — a v5 doc with new knobs still gets the
     // version message, never an unknown-field error.
     let mut doc2: serde_json::Value = serde_json::from_str(LOOKUP_MANIFEST_FIXTURE).unwrap();
-    doc2["version"] = serde_json::json!(4);
+    doc2["version"] = serde_json::json!(5);
     doc2["new_knob"] = serde_json::json!(true);
     let err2 = MoveManifest::from_json(&doc2.to_string()).unwrap_err();
     assert!(err2.to_string().contains("version"), "{err2}");
@@ -232,11 +233,13 @@ fn refuses_within_lane_overlapping_ranges() {
 #[test]
 fn parses_the_lookup_fixture() {
     let m = MoveManifest::from_json(LOOKUP_MANIFEST_FIXTURE).expect("lookup fixture parses");
-    assert_eq!(m.version, 3);
+    assert_eq!(m.version, 4);
     assert!(!m.null_json_deletes_row);
     assert_eq!(m.rowkey_column, "key");
     assert_eq!(m.range_column, "bucket");
     assert_eq!(m.family, "data");
+    assert_eq!(m.qualifier, "jsonz");
+    assert_eq!(m.compression, CellCompression::Gzip);
     assert_eq!(m.bt_instance, "example-instance");
     assert_eq!(m.destination_table, "example_table");
     assert_eq!(m.app_profile, "bulk-write");
@@ -298,6 +301,97 @@ fn lookup_refuses_a_cell_timestamp_in_the_wrong_unit() {
         assert!(
             err.to_string().contains("microseconds since the epoch"),
             "{bad}: {err}"
+        );
+    }
+}
+
+#[test]
+fn lookup_refuses_a_cell_timestamp_in_seconds_by_its_unit() {
+    // Not a whole number of milliseconds either; the unit is the useful
+    // message, as it is at plan's flag.
+    let mut doc: serde_json::Value = serde_json::from_str(LOOKUP_MANIFEST_FIXTURE).unwrap();
+    doc["cell_timestamp_micros"] = serde_json::json!(1_792_003_349i64);
+    let err = MoveManifest::from_json(&doc.to_string()).unwrap_err();
+    assert!(err.to_string().contains("microseconds"), "{err}");
+}
+
+/// The v4 fixture with `version` set to 3 and the two v4 fields removed:
+/// what every v3 author renders. Derived in-test so the two cannot drift.
+fn v3_document() -> String {
+    let mut doc: serde_json::Value = serde_json::from_str(LOOKUP_MANIFEST_FIXTURE).unwrap();
+    doc["version"] = serde_json::json!(3);
+    let obj = doc.as_object_mut().unwrap();
+    obj.remove("qualifier");
+    obj.remove("compression");
+    doc.to_string()
+}
+
+#[test]
+fn a_v3_manifest_parses_with_the_v4_defaults() {
+    let m = MoveManifest::from_json(&v3_document()).expect("v3 parses");
+    assert_eq!(m.version, 3);
+    assert_eq!(m.qualifier, "jsonz");
+    assert_eq!(m.compression, CellCompression::Gzip);
+}
+
+#[test]
+fn a_v4_manifest_may_turn_compression_off() {
+    let doc = lookup_fixture_with("\"compression\": \"gzip\"", "\"compression\": \"none\"");
+    let m = MoveManifest::from_json(&doc).expect("none parses");
+    assert_eq!(m.compression, CellCompression::Uncompressed);
+}
+
+#[test]
+fn refuses_an_unknown_compression() {
+    let doc = lookup_fixture_with("\"compression\": \"gzip\"", "\"compression\": \"zstd\"");
+    let err = MoveManifest::from_json(&doc).unwrap_err();
+    assert!(err.to_string().contains("zstd"), "{err}");
+}
+
+#[test]
+fn refuses_an_empty_qualifier() {
+    let doc = lookup_fixture_with("\"qualifier\": \"jsonz\"", "\"qualifier\": \"\"");
+    let err = MoveManifest::from_json(&doc).unwrap_err();
+    assert!(err.to_string().contains("qualifier"), "{err}");
+}
+
+#[test]
+fn a_manifest_round_trips_through_serde() {
+    let m = MoveManifest::from_json(LOOKUP_MANIFEST_FIXTURE).unwrap();
+    let json = serde_json::to_string(&m).unwrap();
+    let again = MoveManifest::from_json(&json).unwrap();
+    assert_eq!(m, again);
+    let fixture: serde_json::Value = serde_json::from_str(LOOKUP_MANIFEST_FIXTURE).unwrap();
+    assert_eq!(serde_json::to_value(&m).unwrap(), fixture);
+}
+
+#[test]
+fn a_verdict_parses_and_tolerates_unknown_fields() {
+    let v: ShardVerdict = serde_json::from_str(VERDICT_FIXTURE).unwrap();
+    assert_eq!(v.manifest_version, 4);
+    assert_eq!(v.cells_acknowledged, 6_245_100);
+    assert!(matches!(v.outcome, Outcome::Complete));
+    // Lenient on purpose — see the ShardVerdict doc in manifest.rs.
+    let mut doc: serde_json::Value = serde_json::from_str(VERDICT_FIXTURE).unwrap();
+    doc["future_counter"] = serde_json::json!(1);
+    let v2: ShardVerdict = serde_json::from_str(&doc.to_string()).expect("extra field tolerated");
+    assert_eq!(v2.shard_index, 0);
+}
+
+#[test]
+fn compression_and_outcome_strings_agree_across_serde_display_and_fromstr() {
+    for c in [CellCompression::Gzip, CellCompression::Uncompressed] {
+        assert_eq!(c.to_string().parse::<CellCompression>().unwrap(), c);
+        assert_eq!(
+            serde_json::to_value(c).unwrap(),
+            serde_json::json!(c.to_string())
+        );
+    }
+    assert!("zstd".parse::<CellCompression>().is_err());
+    for o in [Outcome::Complete, Outcome::Failed] {
+        assert_eq!(
+            serde_json::to_value(&o).unwrap(),
+            serde_json::json!(o.to_string())
         );
     }
 }

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "table": "projects/example-project/datasets/freighter/tables/source",
+  "billing_project": "example-project",
+  "rowkey_column": "key",
+  "range_column": "bucket",
+  "boundaries": ["k/0500000", "k/1000000"],
+  "buckets": 3,
+  "rows": 1500000,
+  "logical_bytes_per_row": 412.6,
+  "gzip_bytes_per_row": 97.3,
+  "raw_bytes_per_row": 391.0,
+  "max_rows_per_bucket": 620114,
+  "null_json_deletes_row": false
+}

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "ok": false,
+  "shards": 200,
+  "problems": [
+    {"shard": 4, "reason": "no verdict"},
+    {"shard": 7, "reason": "acknowledged 149 cells, source has 150 rows to set"}
+  ],
+  "stray_verdicts": [9]
+}

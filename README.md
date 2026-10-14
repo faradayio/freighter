@@ -37,8 +37,8 @@ column* that preserves key order. Each row becomes one Bigtable cell:
 | | |
 |---|---|
 | Row key | the `key` string's UTF-8 bytes, unchanged |
-| Column | `<family>:jsonz` (family from the manifest) |
-| Value | gzip of the `json` string (readable by Java's `GZIPInputStream`) |
+| Column | `<family>:<qualifier>`, from the manifest (`data:jsonz` by default) |
+| Value | gzip of the `json` string (readable by Java's `GZIPInputStream`), or the string's bytes as they are with `compression: none` |
 | Timestamp | one timestamp for the whole load, from the manifest |
 
 A NULL `json` deletes the row when the manifest sets `null_json_deletes_row`,
@@ -46,11 +46,10 @@ and fails the shard otherwise.
 
 ## Status
 
-v0.1 is the loader engine. Preparing the source table, cutting it into shards
-and checking the verdicts against the source are done by you, with the SQL in
-[docs/preparing-a-source-table.md](docs/preparing-a-source-table.md) and
-[docs/verifying-a-load.md](docs/verifying-a-load.md). `freighter prepare`,
-`plan` and `verify` subcommands that do this for you are planned.
+v0.2 is the loader plus the commands that plan and check a load. A load is
+`prepare`, `plan`, `move`, `verify`: four commands, each one stage, with a
+JSON file between each stage and the next. The
+[quickstart](docs/quickstart.md) runs all four.
 
 ## Install
 
@@ -64,20 +63,41 @@ cargo install bq-freighter   # installs the `freighter` binary
 ## Usage
 
 ```bash
-freighter gs://my-bucket/loads/2026-10-14/manifest.json
+freighter prepare --query-file q.sql --table my-project.my_dataset.freighter_source --out source.json
+freighter plan    --source source.json --lanes 8 --memory 24Gi \
+                  --bt-project my-project --bt-instance my-instance \
+                  --destination-table my_table --app-profile bulk-write --out-dir load
+freighter move    gs://my-bucket/loads/2026-10-14/manifest.json
+freighter verify  gs://my-bucket/loads/2026-10-14/manifest.json --out report.json
 ```
 
-The manifest (`gs://` or `file://`) says what to read, where to write, and how
-to cut the work. Verdicts land next to it as `shard_0000.json`,
-`shard_0001.json`, …
+- **`prepare`** builds the source table from any query that yields
+  `key STRING, json STRING`, and writes a *source record*: the table, its
+  bucket boundaries and the row sizes `plan` needs
+  ([Preparing a source table](docs/preparing-a-source-table.md)).
+- **`plan`** sizes the load for a given memory and lane count and writes the
+  manifest, or one manifest per step of a ramp ([Sizing a load](docs/sizing.md)).
+  Copy it to wherever the mover will run.
+- **`move`** runs a manifest (`gs://` or `file://`). Verdicts land next to it as
+  `shard_0000.json`, `shard_0001.json`, … `freighter <manifest-uri>` with no
+  subcommand does the same.
+- **`verify`** counts the source table per bucket, compares the counts with the
+  verdicts, and writes a report ([Verifying a load](docs/verifying-a-load.md)).
 
-Exit codes: `2` when the manifest could not be read or was refused; `1` when the
-BigQuery or Bigtable connection could not be opened, a lane stopped (three
-consecutive failed shards in one lane), or a verdict could not be written; `0`
-otherwise. **Exit 0 does not mean every shard landed** — a
-lone failed shard gets a `failed` verdict and its lane moves on. The verdicts,
-checked against the source, are the only success criterion
-([docs/verifying-a-load.md](docs/verifying-a-load.md)).
+`freighter validate <file://… | ->` checks a manifest with the mover's own
+validator, without credentials or network: silent with exit 0 when the mover
+would accept it, exit 2 with the reason on stderr when it would not.
+
+Exit codes: `2` when you have something to fix (a manifest that could not be
+read or was refused, a table that already exists, a bad flag); `1` when
+something broke (the BigQuery or Bigtable connection could not be opened, a
+lane stopped after three consecutive failed shards, or a verdict could not be
+written); `0` otherwise. Running `freighter` with no arguments exits 2.
+**Exit 0 from `move` does not mean every shard landed**: a lone failed shard
+gets a `failed` verdict and its lane moves on. The verdicts, checked against
+the source, are the only success criterion, and that check is `verify`. It
+exits 0 only when every shard checks out, 1 when some do not, and 2 when the
+check itself could not run.
 
 Credentials come from Application Default Credentials:
 `GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key, the file
@@ -90,32 +110,21 @@ instance, and `roles/storage.objectViewer` plus `roles/storage.objectCreator`
 on the manifest's bucket. Verdicts are written beside the manifest; if you
 re-run into a prefix that already holds verdicts, overwriting them also needs
 delete, so use `roles/storage.objectUser` there.
+`prepare` and `verify` also run BigQuery jobs, so the identity that runs them
+needs `roles/bigquery.jobUser` on the billing project and
+`roles/bigquery.dataEditor` on the dataset `prepare` writes to.
 
 [examples/k8s/job.yaml](examples/k8s/job.yaml) runs it as a Kubernetes Job.
 
 ## Try it locally
 
-Against the Bigtable emulator, with a source table you own:
-
-```bash
-gcloud components install beta bigtable cbt
-gcloud beta emulators bigtable start --host-port=localhost:8086 &
-export BIGTABLE_EMULATOR_HOST=localhost:8086
-cbt -project example-project -instance example-instance createtable example_table
-cbt -project example-project -instance example-instance createfamily example_table data
-
-# Build a source table (docs/preparing-a-source-table.md), point a copy of
-# freighter/fixtures/freighter-lookup-manifest-example.json at it, then:
-freighter file://$PWD/manifest.json
-cat shard_0000.json
-cbt -project example-project -instance example-instance count example_table
-```
-
-With `BIGTABLE_EMULATOR_HOST` set, writes go to the emulator; reads still come
-from real BigQuery.
+The [quickstart](docs/quickstart.md) runs a whole load into the Bigtable
+emulator. With `BIGTABLE_EMULATOR_HOST` set, writes go to the emulator, but
+BigQuery is always real: you need a project where you can create a table.
 
 ## Documentation
 
+- [Quickstart](docs/quickstart.md) — a whole load against the Bigtable emulator
 - [Concepts](docs/concepts.md) — buckets, shards, lanes, verdicts and the rest
   of the vocabulary
 - [Preparing a source table](docs/preparing-a-source-table.md)
@@ -123,6 +132,8 @@ from real BigQuery.
 - [Verdict reference](docs/verdicts.md)
 - [Sizing a load](docs/sizing.md)
 - [Verifying a load](docs/verifying-a-load.md)
+- [Operating a load](docs/operating.md) — ramps, re-runs and stopping, for a
+  table that serves live reads
 - [Design notes](docs/design.md) — why it is built the way it is
 - [Contributing](CONTRIBUTING.md) — building and testing
 

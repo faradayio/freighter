@@ -1,0 +1,746 @@
+//! BigQuery jobs API over REST: run a statement, poll and page its result,
+//! read a table's metadata. This module is the jobs-API swap boundary — the
+//! only module naming `reqwest` or the REST endpoints. `prepare` and
+//! `verify` use it; the mover never does (it only speaks Storage Read).
+//!
+//! Three endpoints of `bigquery/v2`: `POST projects/{p}/queries` (jobs.query),
+//! `GET projects/{p}/queries/{jobId}` (poll + page), and
+//! `GET projects/{p}/datasets/{d}/tables/{t}`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::error::{Error, Result};
+use crate::retry::{retry_rpc, retryable_http};
+use crate::source::TableRef;
+
+const BASE: &str = "https://bigquery.googleapis.com/bigquery/v2";
+const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+/// How long one `jobs.query` / `getQueryResults` call waits server-side
+/// before answering "not done yet". The poll loop has no sleep of its own:
+/// the server holds each request for this long.
+const WAIT_MS: u64 = 10_000;
+/// Longer than WAIT_MS, so a long-poll never trips the client timeout.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub field_type: String,
+    /// NULLABLE, REQUIRED or REPEATED; absent on some responses.
+    pub mode: Option<String>,
+}
+
+/// One result cell. BigQuery's JSON API renders every scalar as a string
+/// (an INT64 arrives as "123"); arrays nest `{"v": …}` wrappers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cell {
+    Null,
+    Str(String),
+    Array(Vec<Cell>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row(pub Vec<Cell>);
+
+impl Row {
+    fn cell(&self, i: usize) -> Result<&Cell> {
+        self.0
+            .get(i)
+            .ok_or_else(|| Error::BqJob(format!("result row has no column {i}")))
+    }
+    pub fn opt_str(&self, i: usize) -> Result<Option<&str>> {
+        match self.cell(i)? {
+            Cell::Null => Ok(None),
+            Cell::Str(s) => Ok(Some(s)),
+            Cell::Array(_) => Err(Error::BqJob(format!(
+                "column {i} is an array, expected a scalar"
+            ))),
+        }
+    }
+    pub fn str(&self, i: usize) -> Result<&str> {
+        self.opt_str(i)?
+            .ok_or_else(|| Error::BqJob(format!("column {i} is NULL, expected a value")))
+    }
+    pub fn i64(&self, i: usize) -> Result<i64> {
+        let s = self.str(i)?;
+        s.parse()
+            .map_err(|_| Error::BqJob(format!("column {i} value {s:?} is not an integer")))
+    }
+    pub fn strs(&self, i: usize) -> Result<Vec<&str>> {
+        match self.cell(i)? {
+            Cell::Array(items) => items
+                .iter()
+                .map(|c| match c {
+                    Cell::Str(s) => Ok(s.as_str()),
+                    _ => Err(Error::BqJob(format!("column {i} array holds a non-string"))),
+                })
+                .collect(),
+            Cell::Null => Ok(Vec::new()),
+            Cell::Str(_) => Err(Error::BqJob(format!(
+                "column {i} is a scalar, expected an array"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub schema: Vec<Field>,
+    pub rows: Vec<Row>,
+    pub total_bytes_processed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangePartitioning {
+    pub field: String,
+    pub start: i64,
+    pub end: i64,
+    pub interval: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    pub num_rows: u64,
+    pub num_bytes: u64,
+    pub schema: Vec<Field>,
+    pub range_partitioning: Option<RangePartitioning>,
+    pub clustering: Vec<String>,
+    pub expiration_time_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobRef {
+    pub project_id: String,
+    pub job_id: String,
+    pub location: Option<String>,
+}
+
+/// One decoded response page of `jobs.query` / `getQueryResults`.
+#[derive(Debug)]
+pub(crate) struct Page {
+    pub job_complete: bool,
+    pub job: Option<JobRef>,
+    pub schema: Vec<Field>,
+    pub rows: Vec<Row>,
+    pub page_token: Option<String>,
+    pub total_bytes_processed: Option<u64>,
+}
+
+// ---- wire types: private serde mirrors of the REST JSON ---------------------
+
+#[derive(Deserialize)]
+struct WireField {
+    name: String,
+    #[serde(rename = "type")]
+    field_type: String,
+    mode: Option<String>,
+}
+#[derive(Deserialize)]
+struct WireSchema {
+    #[serde(default)]
+    fields: Vec<WireField>,
+}
+#[derive(Deserialize)]
+struct WireValue {
+    v: serde_json::Value,
+}
+#[derive(Deserialize)]
+struct WireRow {
+    f: Vec<WireValue>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireJobReference {
+    project_id: String,
+    job_id: String,
+    location: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireQueryResponse {
+    #[serde(default)]
+    job_complete: bool,
+    job_reference: Option<WireJobReference>,
+    schema: Option<WireSchema>,
+    #[serde(default)]
+    rows: Vec<WireRow>,
+    page_token: Option<String>,
+    total_bytes_processed: Option<String>,
+}
+#[derive(Deserialize)]
+struct WireRange {
+    start: String,
+    end: String,
+    interval: String,
+}
+#[derive(Deserialize)]
+struct WireRangePartitioning {
+    field: String,
+    range: WireRange,
+}
+#[derive(Deserialize)]
+struct WireClustering {
+    #[serde(default)]
+    fields: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireTable {
+    num_rows: Option<String>,
+    num_bytes: Option<String>,
+    schema: Option<WireSchema>,
+    range_partitioning: Option<WireRangePartitioning>,
+    clustering: Option<WireClustering>,
+    expiration_time: Option<String>,
+}
+#[derive(Deserialize)]
+struct WireErrorItem {
+    reason: Option<String>,
+}
+#[derive(Deserialize)]
+struct WireError {
+    message: Option<String>,
+    #[serde(default)]
+    errors: Vec<WireErrorItem>,
+}
+#[derive(Deserialize)]
+struct WireErrorBody {
+    error: WireError,
+}
+
+fn decode_cell(v: serde_json::Value) -> Result<Cell> {
+    match v {
+        serde_json::Value::Null => Ok(Cell::Null),
+        serde_json::Value::String(s) => Ok(Cell::Str(s)),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|item| {
+                let wrapped: WireValue = serde_json::from_value(item)
+                    .map_err(|e| Error::BqJob(format!("array element: {e}")))?;
+                decode_cell(wrapped.v)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Cell::Array),
+        serde_json::Value::Object(_) => Err(Error::BqJob(
+            "a STRUCT value in a result row; freighter's queries return scalars and arrays only"
+                .to_owned(),
+        )),
+        other => Ok(Cell::Str(other.to_string())),
+    }
+}
+
+fn parse_u64(name: &str, s: Option<String>) -> Result<Option<u64>> {
+    s.map(|s| {
+        s.parse()
+            .map_err(|_| Error::BqJob(format!("{name} {s:?} is not an integer")))
+    })
+    .transpose()
+}
+
+fn parse_i64(name: &str, s: &str) -> Result<i64> {
+    s.parse()
+        .map_err(|_| Error::BqJob(format!("{name} {s:?} is not an integer")))
+}
+
+fn fields(schema: Option<WireSchema>) -> Vec<Field> {
+    schema
+        .map(|s| {
+            s.fields
+                .into_iter()
+                .map(|f| Field {
+                    name: f.name,
+                    field_type: f.field_type,
+                    mode: f.mode,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn decode_query_page(body: &[u8]) -> Result<Page> {
+    let w: WireQueryResponse =
+        serde_json::from_slice(body).map_err(|e| Error::BqJob(format!("query response: {e}")))?;
+    let rows = w
+        .rows
+        .into_iter()
+        .map(|r| {
+            r.f.into_iter()
+                .map(|v| decode_cell(v.v))
+                .collect::<Result<Vec<_>>>()
+                .map(Row)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Page {
+        job_complete: w.job_complete,
+        job: w.job_reference.map(|j| JobRef {
+            project_id: j.project_id,
+            job_id: j.job_id,
+            location: j.location,
+        }),
+        schema: fields(w.schema),
+        rows,
+        page_token: w.page_token.filter(|t| !t.is_empty()),
+        total_bytes_processed: parse_u64("totalBytesProcessed", w.total_bytes_processed)?,
+    })
+}
+
+pub(crate) fn decode_table(body: &[u8]) -> Result<TableInfo> {
+    let w: WireTable =
+        serde_json::from_slice(body).map_err(|e| Error::BqJob(format!("table: {e}")))?;
+    let range_partitioning = w
+        .range_partitioning
+        .map(|rp| {
+            Ok::<_, Error>(RangePartitioning {
+                field: rp.field,
+                start: parse_i64("range.start", &rp.range.start)?,
+                end: parse_i64("range.end", &rp.range.end)?,
+                interval: parse_i64("range.interval", &rp.range.interval)?,
+            })
+        })
+        .transpose()?;
+    Ok(TableInfo {
+        num_rows: parse_u64("numRows", w.num_rows)?.unwrap_or(0),
+        num_bytes: parse_u64("numBytes", w.num_bytes)?.unwrap_or(0),
+        schema: fields(w.schema),
+        range_partitioning,
+        clustering: w.clustering.map(|c| c.fields).unwrap_or_default(),
+        expiration_time_ms: w
+            .expiration_time
+            .as_deref()
+            .map(|s| parse_i64("expirationTime", s))
+            .transpose()?,
+    })
+}
+
+/// A failed call, before retry policy is applied.
+#[derive(Debug)]
+pub(crate) enum CallError {
+    Transport(reqwest::Error),
+    Status {
+        code: u16,
+        reason: Option<String>,
+        message: String,
+    },
+    /// The ADC token could not be minted; a metadata-server blip, retried like a wire failure — bqread.rs does the same.
+    Token(String),
+}
+
+impl CallError {
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            // Every call is idempotent (GETs; the POST via requestId), so any wire failure is safe to retry.
+            CallError::Transport(e) => !e.is_builder() && !e.is_redirect(),
+            CallError::Status { code, reason, .. } => retryable_http(*code, reason.as_deref()),
+            CallError::Token(_) => true,
+        }
+    }
+    pub(crate) fn status(&self) -> Option<u16> {
+        match self {
+            CallError::Status { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+    pub(crate) fn reason(&self) -> Option<&str> {
+        match self {
+            CallError::Status { reason, .. } => reason.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Transport(e) => write!(f, "transport: {e}"),
+            CallError::Status {
+                code,
+                reason: Some(r),
+                message,
+            } => {
+                write!(f, "{code} {r}: {message}")
+            }
+            CallError::Status {
+                code,
+                reason: None,
+                message,
+            } => write!(f, "{code}: {message}"),
+            CallError::Token(m) => write!(f, "gcp token: {m}"),
+        }
+    }
+}
+
+/// `error.{message, errors[0].reason}` from an error body; a non-JSON body
+/// (a proxy's HTML) keeps the status and the first 200 bytes.
+pub(crate) fn error_from_body(status: u16, body: &[u8]) -> CallError {
+    match serde_json::from_slice::<WireErrorBody>(body) {
+        Ok(b) => CallError::Status {
+            code: status,
+            reason: b.error.errors.into_iter().next().and_then(|e| e.reason),
+            message: b.error.message.unwrap_or_default(),
+        },
+        Err(_) => CallError::Status {
+            code: status,
+            reason: None,
+            message: String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned(),
+        },
+    }
+}
+
+impl From<CallError> for Error {
+    fn from(e: CallError) -> Self {
+        match e {
+            CallError::Status {
+                code,
+                reason,
+                message,
+            } => Error::BqStatus {
+                code,
+                reason,
+                message,
+            },
+            other => Error::BqJob(other.to_string()),
+        }
+    }
+}
+
+enum Call<'a> {
+    /// The query string is already in the `Url`.
+    Get {
+        url: reqwest::Url,
+    },
+    Post {
+        url: reqwest::Url,
+        body: &'a [u8],
+    },
+}
+
+/// An endpoint under BASE: path segments are pushed (and so percent-encoded)
+/// one by one, and the query string is added only when there is one.
+fn endpoint(segments: &[&str], query: &[(&str, &str)]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(BASE).map_err(|e| Error::BqJob(format!("base url: {e}")))?;
+    url.path_segments_mut()
+        .map_err(|_| Error::BqJob("base url cannot be a base".to_owned()))?
+        .extend(segments);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query);
+    }
+    Ok(url)
+}
+
+/// jobs.query is `POST projects/{p}/queries`; there is no `jobs/query` path
+/// (the live server answers it with an HTML 404).
+fn query_endpoint(billing_project: &str) -> Result<reqwest::Url> {
+    endpoint(&["projects", billing_project, "queries"], &[])
+}
+
+/// The jobs client: one HTTP client and the ADC token provider (the same
+/// chain the mover's Storage Read and Bigtable clients use).
+#[derive(Clone)]
+pub struct BqJobs {
+    http: reqwest::Client,
+    provider: Arc<dyn gcp_auth::TokenProvider>,
+}
+
+impl BqJobs {
+    /// Library users must install a rustls crypto provider first
+    /// (`rustls::crypto::ring::default_provider().install_default()`); the
+    /// binary does this in `main`. reqwest here is built without one.
+    pub async fn connect() -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()
+            .map_err(|e| Error::BqJob(format!("http client: {e}")))?;
+        let provider = gcp_auth::provider()
+            .await
+            .map_err(|e| Error::BqJob(format!("gcp auth provider: {e}")))?;
+        Ok(Self { http, provider })
+    }
+
+    /// One HTTP call with the current bearer token (gcp_auth caches and refreshes it), retried per `retry.rs` on
+    /// transport errors and retryable statuses. Returns the response body.
+    async fn call(
+        &self,
+        what: &str,
+        label: &str,
+        call: &Call<'_>,
+    ) -> std::result::Result<bytes::Bytes, CallError> {
+        let (body, _retries) = retry_rpc(what, label, CallError::is_retryable, |_| async {
+            let token = self
+                .provider
+                .token(&[SCOPE])
+                .await
+                .map_err(|e| CallError::Token(e.to_string()))?;
+            let req = match call {
+                Call::Get { url } => self.http.get(url.clone()),
+                Call::Post { url, body } => self
+                    .http
+                    .post(url.clone())
+                    .header("content-type", "application/json")
+                    .body(body.to_vec()),
+            };
+            let resp = req
+                .bearer_auth(token.as_str())
+                .send()
+                .await
+                .map_err(CallError::Transport)?;
+            let status = resp.status().as_u16();
+            let bytes = resp.bytes().await.map_err(CallError::Transport)?;
+            if (200..300).contains(&status) {
+                Ok(bytes)
+            } else {
+                Err(error_from_body(status, &bytes))
+            }
+        })
+        .await?;
+        Ok(body)
+    }
+
+    /// Runs one statement to completion and returns its whole result,
+    /// following pages. The `requestId` is minted once, outside the retry
+    /// loop, so a re-sent POST dedupes against the job the server already
+    /// started instead of starting a second one.
+    pub async fn query(&self, billing_project: &str, sql: &str) -> Result<QueryResult> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let label = format!("bq request_id={request_id}");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "query": sql,
+            "useLegacySql": false,
+            "timeoutMs": WAIT_MS,
+            "requestId": request_id,
+        }))
+        .map_err(|e| Error::BqJob(format!("request body: {e}")))?;
+        let url = query_endpoint(billing_project)?;
+        let first = self
+            .call("jobs.query", &label, &Call::Post { url, body: &body })
+            .await?;
+        let mut page = decode_query_page(&first)?;
+        let mut schema = std::mem::take(&mut page.schema);
+        let mut rows = std::mem::take(&mut page.rows);
+        let mut total_bytes_processed = page.total_bytes_processed;
+        let mut token = page.page_token.take();
+        let mut polls: u32 = 0;
+        while !page.job_complete || token.is_some() {
+            let job = page
+                .job
+                .clone()
+                .ok_or_else(|| Error::BqJob("query response carries no jobReference".to_owned()))?;
+            let wait = WAIT_MS.to_string();
+            let mut query: Vec<(&str, &str)> = vec![("timeoutMs", &wait)];
+            if let Some(loc) = job.location.as_deref() {
+                query.push(("location", loc));
+            }
+            if let Some(t) = token.as_deref() {
+                query.push(("pageToken", t));
+            }
+            let url = endpoint(
+                &["projects", &job.project_id, "queries", &job.job_id],
+                &query,
+            )?;
+            let bytes = self
+                .call("jobs.getQueryResults", &label, &Call::Get { url })
+                .await?;
+            let mut next = decode_query_page(&bytes)?;
+            if next.job.is_none() {
+                next.job = Some(job.clone());
+            }
+            if schema.is_empty() {
+                schema = std::mem::take(&mut next.schema);
+            }
+            rows.append(&mut next.rows);
+            total_bytes_processed = next.total_bytes_processed.or(total_bytes_processed);
+            if !next.job_complete {
+                polls += 1;
+                if polls.is_multiple_of(6) {
+                    log::info!("bq job {} still running after {} polls", job.job_id, polls);
+                }
+            }
+            token = next.page_token.take();
+            page = next;
+        }
+        Ok(QueryResult {
+            schema,
+            rows,
+            total_bytes_processed: total_bytes_processed.unwrap_or(0),
+        })
+    }
+
+    /// `tables.get`; a `notFound` 404 is `None`.
+    pub async fn table(&self, t: &TableRef) -> Result<Option<TableInfo>> {
+        let url = endpoint(
+            &[
+                "projects", &t.project, "datasets", &t.dataset, "tables", &t.table,
+            ],
+            &[],
+        )?;
+        let label = format!("bq table={t}");
+        match self.call("tables.get", &label, &Call::Get { url }).await {
+            Ok(bytes) => Ok(Some(decode_table(&bytes)?)),
+            // Only BigQuery's own notFound: a 404 from a wrong path (an HTML
+            // page, no reason) is an error, never "the table is absent".
+            Err(e) if e.status() == Some(404) && e.reason() == Some("notFound") => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests; the workspace denies unwrap_used
+mod tests {
+    use super::*;
+
+    const PAGE: &str = r#"{
+      "kind": "bigquery#queryResponse",
+      "jobReference": {"projectId": "example-project", "jobId": "job_1", "location": "US"},
+      "jobComplete": true,
+      "schema": {"fields": [
+        {"name": "cuts", "type": "STRING", "mode": "REPEATED"},
+        {"name": "lowest", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "row_count", "type": "INTEGER", "mode": "NULLABLE"}]},
+      "rows": [{"f": [{"v": [{"v": "a"}, {"v": "b"}]}, {"v": "a"}, {"v": "1500000"}]},
+               {"f": [{"v": []}, {"v": null}, {"v": "0"}]}],
+      "totalBytesProcessed": "12345",
+      "pageToken": "next"
+    }"#;
+
+    #[test]
+    fn decodes_a_page_with_arrays_nulls_and_integers() {
+        let page = decode_query_page(PAGE.as_bytes()).unwrap();
+        assert!(page.job_complete);
+        let job = page.job.unwrap();
+        assert_eq!(
+            (job.project_id.as_str(), job.job_id.as_str()),
+            ("example-project", "job_1")
+        );
+        assert_eq!(job.location.as_deref(), Some("US"));
+        assert_eq!(page.page_token.as_deref(), Some("next"));
+        assert_eq!(page.total_bytes_processed, Some(12345));
+        assert_eq!(
+            page.schema[2],
+            Field {
+                name: "row_count".into(),
+                field_type: "INTEGER".into(),
+                mode: Some("NULLABLE".into())
+            }
+        );
+        assert_eq!(page.rows[0].strs(0).unwrap(), vec!["a", "b"]);
+        assert_eq!(page.rows[0].str(1).unwrap(), "a");
+        assert_eq!(page.rows[0].i64(2).unwrap(), 1_500_000);
+        assert_eq!(page.rows[1].strs(0).unwrap(), Vec::<&str>::new());
+        assert_eq!(page.rows[1].opt_str(1).unwrap(), None);
+        assert!(
+            page.rows[1].str(1).is_err(),
+            "NULL where a string is required"
+        );
+        assert!(page.rows[0].i64(1).is_err(), "'a' is not an integer");
+    }
+
+    #[test]
+    fn an_incomplete_job_has_no_rows_yet() {
+        let doc = r#"{"jobReference": {"projectId": "p", "jobId": "j"}, "jobComplete": false}"#;
+        let page = decode_query_page(doc.as_bytes()).unwrap();
+        assert!(!page.job_complete);
+        assert!(page.rows.is_empty());
+        assert!(page.schema.is_empty());
+    }
+
+    #[test]
+    fn a_struct_value_is_refused() {
+        let doc = r#"{"jobComplete": true, "rows": [{"f": [{"v": {"f": [{"v": "x"}]}}]}]}"#;
+        let err = decode_query_page(doc.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("STRUCT"), "{err}");
+    }
+
+    #[test]
+    fn decodes_table_info() {
+        let doc = r#"{
+          "numRows": "1500000", "numBytes": "618900000",
+          "schema": {"fields": [{"name": "key", "type": "STRING"}, {"name": "json", "type": "STRING"}, {"name": "bucket", "type": "INTEGER"}]},
+          "rangePartitioning": {"field": "bucket", "range": {"start": "0", "end": "16", "interval": "1"}},
+          "clustering": {"fields": ["key"]},
+          "expirationTime": "1800000000000"
+        }"#;
+        let t = decode_table(doc.as_bytes()).unwrap();
+        assert_eq!((t.num_rows, t.num_bytes), (1_500_000, 618_900_000));
+        assert_eq!(t.schema[0].field_type, "STRING");
+        assert!(t.schema[0].mode.is_none());
+        let rp = t.range_partitioning.unwrap();
+        assert_eq!(
+            (rp.field.as_str(), rp.start, rp.end, rp.interval),
+            ("bucket", 0, 16, 1)
+        );
+        assert_eq!(t.clustering, vec!["key"]);
+        assert_eq!(t.expiration_time_ms, Some(1_800_000_000_000));
+        let bare = decode_table(br#"{"numRows": "0", "numBytes": "0"}"#).unwrap();
+        assert!(bare.range_partitioning.is_none());
+        assert!(bare.clustering.is_empty());
+        assert!(bare.expiration_time_ms.is_none());
+    }
+
+    #[test]
+    fn error_bodies_classify_by_status_and_reason() {
+        let body = br#"{"error": {"code": 403, "message": "Exceeded rate limits", "errors": [{"reason": "rateLimitExceeded", "message": "Exceeded rate limits"}], "status": "PERMISSION_DENIED"}}"#;
+        let e = error_from_body(403, body);
+        assert!(e.is_retryable());
+        assert_eq!(e.to_string(), "403 rateLimitExceeded: Exceeded rate limits");
+        let e = error_from_body(404, br#"{"error": {"code": 404, "message": "Not found: Table p:d.t", "errors": [{"reason": "notFound"}]}}"#);
+        assert!(!e.is_retryable());
+        assert_eq!(e.status(), Some(404));
+        assert!(e.to_string().contains("notFound"));
+        assert_eq!(e.reason(), Some("notFound"));
+        assert_eq!(
+            Error::from(e).to_string(),
+            "bq job: 404 notFound: Not found: Table p:d.t"
+        );
+        assert_eq!(
+            Error::from(error_from_body(502, b"bad gateway")).to_string(),
+            "bq job: 502: bad gateway"
+        );
+        assert!(error_from_body(404, b"<html>Not Found</html>")
+            .reason()
+            .is_none());
+        let e = error_from_body(503, b"<html>bad gateway</html>");
+        assert!(e.is_retryable());
+        assert!(e.to_string().starts_with("503"));
+        let e = error_from_body(403, br#"{"error": {"code": 403, "message": "Access Denied", "errors": [{"reason": "accessDenied"}]}}"#);
+        assert!(
+            !e.is_retryable(),
+            "a 403 without rateLimitExceeded is not retried"
+        );
+        let e = error_from_body(429, br#"{"error": {"code": 429, "message": "Too many", "errors": [{"reason": "rateLimitExceeded"}]}}"#);
+        assert!(e.is_retryable());
+        let e = error_from_body(400, br#"{"error": {"code": 400, "message": "Job rate limit", "errors": [{"reason": "jobRateLimitExceeded"}]}}"#);
+        assert!(
+            !e.is_retryable(),
+            "job-level errors need a new job id, never a re-send"
+        );
+    }
+
+    #[test]
+    fn a_200_with_a_warning_errors_array_is_not_a_failure() {
+        let doc = r#"{"jobComplete": true, "errors": [{"reason": "warning", "message": "x"}], "rows": []}"#;
+        assert!(decode_query_page(doc.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn endpoints_encode_segments_and_omit_an_empty_query() {
+        let u = endpoint(&["projects", "p", "datasets", "d", "tables", "t"], &[]).unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://bigquery.googleapis.com/bigquery/v2/projects/p/datasets/d/tables/t"
+        );
+        let u = endpoint(
+            &["projects", "p", "queries", "job_1"],
+            &[("timeoutMs", "10000"), ("location", "US")],
+        )
+        .unwrap();
+        assert_eq!(u.as_str(), "https://bigquery.googleapis.com/bigquery/v2/projects/p/queries/job_1?timeoutMs=10000&location=US");
+        let u = endpoint(&["projects", "a b/c"], &[]).unwrap();
+        assert!(u.as_str().ends_with("/projects/a%20b%2Fc"));
+        assert_eq!(
+            query_endpoint("p").unwrap().as_str(),
+            "https://bigquery.googleapis.com/bigquery/v2/projects/p/queries"
+        );
+    }
+}

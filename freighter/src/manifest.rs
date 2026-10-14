@@ -8,7 +8,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub const MOVE_MANIFEST_VERSION: u32 = 3;
+/// MutateRows allows 100k mutations per request; one row is one mutation, so
+/// this stays under it with room.
+pub const MAX_FLUSH_CELLS: usize = 90_000;
+/// The version `plan` writes.
+pub const MOVE_MANIFEST_VERSION: u32 = 4;
+/// What this mover reads. A version-3 document is read as version 4 with
+/// `qualifier` and `compression` at their defaults, so a caller that renders
+/// v3 keeps working across the bump. The version is not cross-checked against
+/// field presence: a v3 document carrying the v4 fields, or a v4 document
+/// without them, both parse.
+pub const SUPPORTED_MANIFEST_VERSIONS: [u32; 2] = [3, 4];
 
 /// The smallest plausible `cell_timestamp_micros`: 2001-09-09 in microseconds.
 /// A timestamp given in seconds or milliseconds sits far below it and would
@@ -33,7 +43,7 @@ struct VersionProbe {
 // deny_unknown_fields cannot apply to this internally-tagged enum (serde
 // limitation), so an extra key beside `lo`/`hi` is silently dropped —
 // accepted residual.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ShardRange {
     /// Contiguous signed-int64 range of the manifest's range column,
@@ -41,7 +51,7 @@ pub enum ShardRange {
     Int { lo: i64, hi: i64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShardSpec {
     pub index: u32,
@@ -77,7 +87,46 @@ impl std::fmt::Display for ShardLabel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// How the cell value is encoded from the `json` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CellCompression {
+    /// gzip at flate2's default level — the framing Java's GZIPInputStream reads.
+    #[default]
+    Gzip,
+    /// The `json` string's UTF-8 bytes as they are. Named so it never reads
+    /// as `Option::None` in a match.
+    #[serde(rename = "none")]
+    Uncompressed,
+}
+
+impl std::str::FromStr for CellCompression {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "gzip" => Ok(Self::Gzip),
+            "none" => Ok(Self::Uncompressed),
+            other => Err(Error::Refused(format!(
+                "compression {other:?}: expected gzip or none"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for CellCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Gzip => "gzip",
+            Self::Uncompressed => "none",
+        })
+    }
+}
+
+fn default_qualifier() -> String {
+    "jsonz".to_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MoveManifest {
     pub version: u32,
@@ -95,6 +144,12 @@ pub struct MoveManifest {
     /// every check here and quietly loses the append-order write path.
     pub range_column: String,
     pub family: String,
+    /// Column qualifier of the one cell. v4; a v3 document gets `jsonz`.
+    #[serde(default = "default_qualifier")]
+    pub qualifier: String,
+    /// Cell value encoding. v4; a v3 document gets gzip.
+    #[serde(default)]
+    pub compression: CellCompression,
     pub bt_project: String,
     pub bt_instance: String,
     pub destination_table: String,
@@ -125,15 +180,43 @@ pub struct MoveManifest {
     pub rung: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Complete,
     Failed,
 }
 
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+/// The file a shard's verdict lands in, beside the manifest.
+pub(crate) fn verdict_file_name(index: u32) -> String {
+    format!("shard_{index:04}.json")
+}
+
+/// `shard_<digits>.json` -> the index; the inverse of `verdict_file_name`,
+/// which also takes unpadded digits. Anything else beside the manifest (the
+/// manifest itself, a step directory) is not a verdict.
+pub(crate) fn verdict_index(file_name: &str) -> Option<u32> {
+    let digits = file_name.strip_prefix("shard_")?.strip_suffix(".json")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// A mover's verdict on one shard: outcome, row/cell counts, latencies, and resilience counters.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Deliberately no `deny_unknown_fields`: a verdict from a newer mover may carry
+/// counters this `verify` doesn't know, and it must still be readable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardVerdict {
     pub manifest_version: u32,
     pub shard_index: u32,
@@ -193,7 +276,7 @@ pub struct ShardVerdict {
 /// CROSS-lane disjointness is the launcher's guarantee (it partitions the
 /// shard ranges), not validated here — this tripwire covers
 /// within-lane order only.
-fn validate_lanes(shards: &[ShardSpec]) -> Result<()> {
+pub(crate) fn validate_lanes(shards: &[ShardSpec]) -> Result<()> {
     let max_lane = shards.iter().map(|s| s.lane).max().unwrap_or(0);
     if max_lane == 0 {
         return Ok(());
@@ -224,14 +307,41 @@ fn validate_lanes(shards: &[ShardSpec]) -> Result<()> {
     Ok(())
 }
 
+/// The one rule for a cell timestamp, shared by the manifest validator and
+/// `plan`'s flag. The range comes before the whole-millisecond check: a value
+/// in seconds is rarely a multiple of 1000, and the unit is the useful message.
+pub fn check_cell_timestamp(ts: i64) -> Result<()> {
+    if ts <= 0 {
+        return Err(Error::Manifest(format!(
+            "cell_timestamp_micros {ts} must be positive"
+        )));
+    }
+    if !(MIN_CELL_TIMESTAMP_MICROS..=MAX_CELL_TIMESTAMP_MICROS).contains(&ts) {
+        return Err(Error::Manifest(format!(
+            "cell_timestamp_micros {ts} is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20) — seconds or milliseconds stamp cells in 1970, where they lose to every existing cell; nanoseconds stamp them millennia ahead, where they beat every later load"
+        )));
+    }
+    if ts % 1000 != 0 {
+        return Err(Error::Manifest(format!(
+            "cell_timestamp_micros {ts} must be a whole number of milliseconds — Bigtable stores millisecond granularity"
+        )));
+    }
+    Ok(())
+}
+
 impl MoveManifest {
     pub fn from_json(doc: &str) -> Result<Self> {
         let probe: VersionProbe =
             serde_json::from_str(doc).map_err(|e| Error::Manifest(format!("parse: {e}")))?;
-        if probe.version != MOVE_MANIFEST_VERSION {
+        if !SUPPORTED_MANIFEST_VERSIONS.contains(&probe.version) {
             return Err(Error::Manifest(format!(
-                "version {} unsupported; this mover understands {MOVE_MANIFEST_VERSION}",
-                probe.version
+                "version {} unsupported; this mover understands {}",
+                probe.version,
+                SUPPORTED_MANIFEST_VERSIONS
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
             )));
         }
         let m: MoveManifest =
@@ -243,8 +353,9 @@ impl MoveManifest {
         for shard in &m.shards {
             if !seen.insert(shard.index) {
                 return Err(Error::Manifest(format!(
-                    "duplicate shard index {} — verdicts land at shard_{:04}.json and would overwrite",
-                    shard.index, shard.index
+                    "duplicate shard index {} — verdicts land at {} and would overwrite",
+                    shard.index,
+                    verdict_file_name(shard.index)
                 )));
             }
             let ShardRange::Int { lo, hi } = shard.range;
@@ -260,17 +371,12 @@ impl MoveManifest {
                 "range_column must name an integer column distinct from the rowkey column — int-banding a string keyspace is refused".to_owned(),
             ));
         }
-        let ts = m.cell_timestamp_micros;
-        if ts <= 0 || ts % 1000 != 0 {
-            return Err(Error::Manifest(format!(
-                "cell_timestamp_micros {ts} must be positive and a whole number of milliseconds — Bigtable stores millisecond granularity"
-            )));
+        if m.qualifier.is_empty() {
+            return Err(Error::Manifest(
+                "qualifier must be non-empty — it names the cell's column".to_owned(),
+            ));
         }
-        if !(MIN_CELL_TIMESTAMP_MICROS..=MAX_CELL_TIMESTAMP_MICROS).contains(&ts) {
-            return Err(Error::Manifest(format!(
-                "cell_timestamp_micros {ts} is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20) — seconds or milliseconds stamp cells in 1970, where they lose to every existing cell; nanoseconds stamp them millennia ahead, where they beat every later load"
-            )));
-        }
+        check_cell_timestamp(m.cell_timestamp_micros)?;
         if m.read_streams <= 0 {
             return Err(Error::Manifest(format!(
                 "read_streams {} must be positive — pick the stream count explicitly",
@@ -280,9 +386,9 @@ impl MoveManifest {
         // MutateRows allows up to 100k entries and 100k mutations per
         // request. A row is one cell or one delete, so a request of
         // `flush_cells` rows is that many of each.
-        if m.flush_cells == 0 || m.flush_cells > 90_000 {
+        if m.flush_cells == 0 || m.flush_cells > MAX_FLUSH_CELLS {
             return Err(Error::Manifest(format!(
-                "flush_cells {} outside (0, 90000] — stay below the 100k mutation limit",
+                "flush_cells {} outside (0, {MAX_FLUSH_CELLS}] — stay below the 100k mutation limit",
                 m.flush_cells
             )));
         }
@@ -294,5 +400,21 @@ impl MoveManifest {
         }
         validate_lanes(&m.shards)?;
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_files_are_recognised_by_name() {
+        assert_eq!(verdict_file_name(4), "shard_0004.json");
+        assert_eq!(verdict_index(&verdict_file_name(4)), Some(4));
+        assert_eq!(verdict_index("shard_12345.json"), Some(12345));
+        assert_eq!(verdict_index("manifest.json"), None);
+        assert_eq!(verdict_index("shard_.json"), None);
+        assert_eq!(verdict_index("shard_0004.json.bak"), None);
+        assert_eq!(verdict_index("shard_x.json"), None);
     }
 }

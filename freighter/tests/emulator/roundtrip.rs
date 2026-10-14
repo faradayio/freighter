@@ -418,3 +418,42 @@ async fn a_repeated_key_is_written_per_occurrence_and_ends_as_one_cell() {
         .unwrap();
     assert_eq!(json, r#"{"v":2}"#);
 }
+
+#[tokio::test]
+async fn uncompressed_cells_land_as_raw_json_under_the_configured_qualifier() {
+    support::require_emulator();
+    let (client, table) = support::fresh_lookup_table("mover_raw").await;
+    let config = freighter::cells::TableConfig {
+        qualifier: b"raw".to_vec(),
+        compression: freighter::manifest::CellCompression::Uncompressed,
+        ..support::lookup_config()
+    };
+    let source = [("r1", r#"{"v":1}"#), ("r2", r#"{"v":2}"#)];
+    let batch = support::lookup_cells(&source);
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(support::decoded(&batch, &config)).await.unwrap();
+    drop(tx);
+    let counters = Arc::new(Counters::default());
+    write_batches(
+        rx,
+        &client,
+        &table,
+        2,
+        Arc::clone(&counters),
+        &Arc::new(tokio::sync::Semaphore::new(100)),
+    )
+    .await
+    .expect("write_batches");
+    assert_eq!(counters.cells_acknowledged(), 2);
+    assert_eq!(counters.cells_failed(), 0);
+    for (key, json) in source {
+        let rows = support::read_back_all(&client, &table, &[key.as_bytes().to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "row {key} present");
+        assert_eq!(rows[0].cells.len(), 1, "exactly one cell in row {key}");
+        let cell = &rows[0].cells[0];
+        assert_eq!(cell.qualifier, b"raw".to_vec());
+        assert_eq!(cell.value, json.as_bytes().to_vec());
+    }
+}

@@ -1,21 +1,20 @@
-//! Pure decode: `(key, json)` rows -> one gzipped cell per row (family `data`,
-//! qualifier `jsonz`, value = gzip(UTF-8 json), row key = the key string's
-//! bytes). No I/O and no clock: every cell carries the manifest's
+//! Pure decode: `(key, json)` rows -> one cell per row (family and qualifier
+//! from the manifest, value = gzip(UTF-8 json) or the UTF-8 bytes unchanged,
+//! per the manifest's `compression`, row key = the key string's bytes). No
+//! I/O and no clock: every cell carries the manifest's
 //! `cell_timestamp_micros`.
 
 use std::io::Write;
 
-use crate::cells::{col, refuse_null_slots, TableConfig};
+use crate::cells::{col, refuse_null_slots, TableConfig, JSON_COLUMN};
 use crate::client::{CellWrite, RowChange, RowWrite};
 use crate::error::{Error, Result};
+use crate::manifest::CellCompression;
 use arrow_array::Array;
 use arrow_array::RecordBatch;
 use arrow_array::StringArray;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-
-const JSON_COLUMN: &str = "json";
-const JSONZ_QUALIFIER: &[u8] = b"jsonz";
 
 /// The Storage Read column list for a lookup source table. The shard
 /// `range_column` is restricted on, never projected.
@@ -23,18 +22,27 @@ pub fn lookup_selected_fields(shape: &TableConfig) -> Vec<String> {
     vec![shape.rowkey_column.clone(), JSON_COLUMN.to_owned()]
 }
 
-fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(bytes)
-        .map_err(|e| Error::Decode(format!("gzip: {e}")))?;
-    let mut value = encoder
-        .finish()
-        .map_err(|e| Error::Decode(format!("gzip: {e}")))?;
-    // The encoder's buffer grows by doubling; the value stays resident until
-    // its shard is written, so the spare half is given back here.
-    value.shrink_to_fit();
-    Ok(value)
+/// The cell value for one `json` string: gzip at flate2's default level (the
+/// framing Java's GZIPInputStream reads) or the bytes as they are. Shared
+/// with `prepare`'s row-size sample, so the sizes it measures are exactly
+/// what the mover writes.
+pub(crate) fn encode_value(json: &[u8], compression: CellCompression) -> Result<Vec<u8>> {
+    match compression {
+        CellCompression::Uncompressed => Ok(json.to_vec()),
+        CellCompression::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder
+                .write_all(json)
+                .map_err(|e| Error::Decode(format!("gzip: {e}")))?;
+            let mut value = encoder
+                .finish()
+                .map_err(|e| Error::Decode(format!("gzip: {e}")))?;
+            // The encoder's buffer grows by doubling; the value stays resident
+            // until its shard is written, so the spare half is given back here.
+            value.shrink_to_fit();
+            Ok(value)
+        }
+    }
 }
 
 /// Decodes one lookup batch into rows, one per BQ row: a single-cell set,
@@ -57,9 +65,9 @@ pub fn decode_lookup(batch: &RecordBatch, shape: &TableConfig) -> Result<Vec<Row
         } else {
             RowChange::Set(vec![CellWrite {
                 family: shape.family.clone(),
-                qualifier: JSONZ_QUALIFIER.to_vec(),
+                qualifier: shape.qualifier.clone(),
                 timestamp_micros,
-                value: gzip(json.value(i).as_bytes())?,
+                value: encode_value(json.value(i).as_bytes(), shape.compression)?,
             }])
         };
         out.push(RowWrite {
@@ -88,6 +96,8 @@ mod tests {
         TableConfig {
             rowkey_column: "key".into(),
             family: "data".into(),
+            qualifier: b"jsonz".to_vec(),
+            compression: CellCompression::Gzip,
             cell_timestamp_micros: TIMESTAMP_MICROS,
             null_json_deletes_row: false,
         }
@@ -204,12 +214,35 @@ mod tests {
             json.push_str(&format!("{},null,", state >> 40));
         }
         json.push_str("0]");
-        let value = gzip(json.as_bytes()).unwrap();
+        let value = encode_value(json.as_bytes(), CellCompression::Gzip).unwrap();
         assert!(
             value.len() > 1_000,
             "test input compressed to {}",
             value.len()
         );
         assert_eq!(value.capacity(), value.len());
+    }
+
+    #[test]
+    fn uncompressed_writes_the_json_bytes_under_the_configured_qualifier() {
+        let config = TableConfig {
+            qualifier: b"j".to_vec(),
+            compression: CellCompression::Uncompressed,
+            ..lookup_config()
+        };
+        let rows = [(Some("k"), Some(r#"{"a":1}"#))];
+        let decoded = decode_lookup(&batch(&rows), &config).unwrap();
+        let cell = &set_cells(&decoded[0])[0];
+        assert_eq!(cell.qualifier, b"j".to_vec());
+        assert_eq!(cell.value, br#"{"a":1}"#.to_vec());
+    }
+
+    #[test]
+    fn encode_value_gzips_or_passes_through() {
+        let raw = encode_value(b"{}", CellCompression::Uncompressed).unwrap();
+        assert_eq!(raw, b"{}".to_vec());
+        let gz = encode_value(b"{}", CellCompression::Gzip).unwrap();
+        assert_eq!(&gz[..2], &[0x1f, 0x8b]);
+        assert_eq!(gunzip(&gz), "{}");
     }
 }

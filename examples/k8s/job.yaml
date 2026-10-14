@@ -31,8 +31,8 @@ spec:
       serviceAccountName: freighter # bound to a Google service account
       containers:
         - name: freighter
-          image: ghcr.io/faradayio/freighter:v0.1.0
-          args: ["gs://my-bucket/loads/2026-10-14/manifest.json"]
+          image: ghcr.io/faradayio/freighter:v0.2.0
+          args: ["move", "gs://my-bucket/loads/2026-10-14/manifest.json"]
           env:
             - { name: RUST_LOG, value: info }
           resources:

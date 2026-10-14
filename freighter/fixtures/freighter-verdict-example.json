@@ -1,5 +1,5 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 4,
   "shard_index": 0,
   "rows_read": 6245162,
   "cells_encoded": 6245100,

@@ -21,8 +21,10 @@ pub struct TableRef {
     pub table: String,
 }
 
-fn plain_identifier(part: &str, what: &str) -> Result<()> {
-    if part.is_empty() || part.contains('`') || part.contains('/') {
+fn plain_identifier(part: &str, what: &str, allow_dot: bool) -> Result<()> {
+    let bad =
+        part.is_empty() || part.contains(['`', '\\', '/']) || (!allow_dot && part.contains('.'));
+    if bad {
         return Err(Error::Refused(format!(
             "{what} {part:?} is not a plain identifier"
         )));
@@ -43,9 +45,10 @@ impl TableRef {
     }
 
     fn new(project: &str, dataset: &str, table: &str) -> Result<Self> {
-        plain_identifier(project, "project")?;
-        plain_identifier(dataset, "dataset")?;
-        plain_identifier(table, "table")?;
+        // Domain-scoped project ids (`example.com:proj`) are legacy but valid.
+        plain_identifier(project, "project", true)?;
+        plain_identifier(dataset, "dataset", false)?;
+        plain_identifier(table, "table", false)?;
         Ok(Self {
             project: project.to_owned(),
             dataset: dataset.to_owned(),
@@ -68,7 +71,8 @@ impl TableRef {
 
 impl FromStr for TableRef {
     type Err = Error;
-    /// `project.dataset.table`.
+    /// `project.dataset.table`. A domain-scoped project id (`example.com:proj`)
+    /// cannot be written in this form; use the path form.
     fn from_str(s: &str) -> Result<Self> {
         let parts: Vec<&str> = s.split('.').collect();
         match parts.as_slice() {
@@ -102,6 +106,7 @@ pub struct SourceRecord {
     pub rowkey_column: String,
     /// Recorded for readers; the mover's decoder reads `json` by name.
     pub json_column: String,
+    /// The INT64 bucket column the boundaries cut: order-preserving over the key, the manifest's `range_column`.
     pub range_column: String,
     /// Interior quantile cuts, ascending; bucket i >= 1 starts at boundaries[i-1].
     pub boundaries: Vec<String>,
@@ -153,11 +158,23 @@ impl SourceRecord {
                 "max_rows_per_bucket must be positive".to_owned(),
             ));
         }
+        if s.max_rows_per_bucket > s.rows {
+            return Err(Error::Source(format!(
+                "max_rows_per_bucket {} exceeds rows {}",
+                s.max_rows_per_bucket, s.rows
+            )));
+        }
+        if s.max_rows_per_bucket * u64::from(s.buckets) < s.rows {
+            return Err(Error::Source(format!(
+                "max_rows_per_bucket {} × {} buckets cannot hold {} rows",
+                s.max_rows_per_bucket, s.buckets, s.rows
+            )));
+        }
         for (name, v) in [
             ("gzip_bytes_per_row", s.gzip_bytes_per_row),
             ("raw_bytes_per_row", s.raw_bytes_per_row),
         ] {
-            // `!(v > 0.0)`, not `v <= 0.0`: NaN must be refused too.
+            // Fields are pub, so a hand-built record can carry NaN; JSON cannot.
             #[allow(clippy::neg_cmp_op_on_partial_ord)]
             if !(v > 0.0) {
                 return Err(Error::Source(format!(
@@ -178,7 +195,7 @@ impl SourceRecord {
     }
 
     pub fn table_ref(&self) -> Result<TableRef> {
-        TableRef::from_path(&self.table)
+        TableRef::from_path(&self.table).map_err(|e| Error::Source(e.to_string()))
     }
 
     /// The one place the gzip-vs-raw sizing choice is made.

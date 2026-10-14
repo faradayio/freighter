@@ -54,10 +54,34 @@ fn source_record_refuses_inconsistent_cuts_and_unmeasured_sizes() {
 
     let mut doc: serde_json::Value = serde_json::from_str(SOURCE_FIXTURE).unwrap();
     doc["rows"] = serde_json::json!(0);
-    assert!(SourceRecord::from_json(&doc.to_string()).is_err());
-    let mut doc: serde_json::Value = serde_json::from_str(SOURCE_FIXTURE).unwrap();
-    doc["max_rows_per_bucket"] = serde_json::json!(0);
-    assert!(SourceRecord::from_json(&doc.to_string()).is_err());
+    let err = SourceRecord::from_json(&doc.to_string()).unwrap_err();
+    assert!(err.to_string().contains("rows"), "{err}");
+
+    let cases = [
+        (
+            "max_rows_per_bucket",
+            serde_json::json!(0),
+            "max_rows_per_bucket",
+        ),
+        (
+            "boundaries",
+            serde_json::json!(["k/0500000", "k/0500000"]),
+            "ascending",
+        ),
+        ("range_column", serde_json::json!("key"), "range_column"),
+        ("max_rows_per_bucket", serde_json::json!(100), "cannot hold"),
+        (
+            "max_rows_per_bucket",
+            serde_json::json!(2_000_000),
+            "exceeds rows",
+        ),
+    ];
+    for (field, value, expect) in cases {
+        let mut doc: serde_json::Value = serde_json::from_str(SOURCE_FIXTURE).unwrap();
+        doc[field] = value;
+        let err = SourceRecord::from_json(&doc.to_string()).unwrap_err();
+        assert!(err.to_string().contains(expect), "{field}: {err}");
+    }
 }
 
 #[test]
@@ -84,4 +108,9 @@ fn table_ref_parses_both_spellings() {
     assert!("a.b.c.d".parse::<TableRef>().is_err());
     assert!(TableRef::from_path("projects/p/tables/t").is_err());
     assert!("p.d.we`ird".parse::<TableRef>().is_err());
+    assert!("p..t".parse::<TableRef>().is_err());
+    assert!("p.d/x.t".parse::<TableRef>().is_err());
+    assert!(r"p.d.t\x".parse::<TableRef>().is_err());
+    assert!(TableRef::from_path("projects/p/datasets/a.b/tables/t").is_err());
+    assert!(TableRef::from_path("projects/example.com:proj/datasets/d/tables/t").is_ok());
 }

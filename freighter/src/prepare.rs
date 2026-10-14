@@ -5,7 +5,7 @@
 pub mod boundaries;
 pub mod queries;
 
-use crate::bqjobs::{BqJobs, QueryResult};
+use crate::bqjobs::{BqJobs, QueryResult, TableInfo};
 use crate::error::{Error, Result};
 use crate::lookup::encode_value;
 use crate::manifest::CellCompression;
@@ -14,7 +14,8 @@ use crate::source::{SourceRecord, TableRef, SOURCE_RECORD_VERSION};
 use boundaries::{shard_boundaries, MAX_BUCKETS};
 use queries::{BUCKET, JSON, KEY};
 
-/// Buckets sampled for row sizes, and rows read from each.
+/// Buckets sampled for row sizes, and rows read from each. 2,000 rows from 10
+/// buckets bound the sample's cost and are plenty for a mean.
 const SAMPLE_BUCKETS: u32 = 10;
 const SAMPLE_ROWS_PER_BUCKET: u32 = 200;
 
@@ -24,9 +25,9 @@ pub struct PrepareConfig {
     pub query: String,
     pub table: TableRef,
     pub billing_project: String,
-    /// Ceiling on the cut; thinned to `MIN_ROWS_PER_BUCKET`.
+    /// An upper bound on the cut; thinning may leave fewer.
     pub buckets: u32,
-    /// 0 = never.
+    /// Days until BigQuery drops the table; 0 = it never expires.
     pub expires_days: u32,
     pub null_json_deletes_row: bool,
 }
@@ -68,66 +69,22 @@ pub(crate) fn measure_row_sizes(sample: &QueryResult) -> Result<RowSizes> {
     })
 }
 
-/// Builds the source table and returns its record. Refuses (exit 2) before
-/// any scan when the table exists or the query's columns are wrong, and
-/// after the quantile scan when the query yields no rows.
-pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
-    if !(1..=MAX_BUCKETS).contains(&cfg.buckets) {
-        return Err(Error::Refused(format!(
-            "buckets must be between 1 and {MAX_BUCKETS}; got {}",
-            cfg.buckets
-        )));
-    }
-    // 1. Checked before the quantile pass, which scans the whole target.
-    if jobs.table(&cfg.table).await?.is_some() {
-        return Err(Error::Refused(format!(
-            "{} already exists; its boundaries also pre-split the Bigtable table, so drop it deliberately before rebuilding",
-            cfg.table
-        )));
-    }
-    // 2. Column types, for free. A query BigQuery rejects (400 invalidQuery:
-    // a missing column, a syntax error) is the user's to fix: exit 2.
-    let probe = match jobs
-        .query(&cfg.billing_project, &queries::schema_probe(&cfg.query))
-        .await
-    {
-        Ok(p) => p,
-        Err(Error::BqJob(m)) if m.contains("invalidQuery") => {
-            return Err(Error::Refused(format!("the query is not valid: {m}")))
-        }
-        Err(e) => return Err(e),
-    };
-    queries::check_schema(&probe.schema)?;
-    // 3. Quantiles.
-    let q = jobs
-        .query(
-            &cfg.billing_project,
-            &queries::quantiles(&cfg.query, cfg.buckets, cfg.null_json_deletes_row),
-        )
-        .await?;
-    let Some(q) = queries::decode_quantiles(&q)? else {
-        return Err(Error::Refused(
-            "the query yields no rows to load".to_owned(),
-        ));
-    };
-    // 4. Boundaries.
-    let boundaries = shard_boundaries(&q.cuts, &q.lowest, q.rows);
-    let buckets = boundaries.len() as u32 + 1;
-    log::info!(
-        "prepare: {} rows, {} buckets after thinning (asked for {})",
-        q.rows,
-        buckets,
-        cfg.buckets
-    );
-    // 5. Build.
-    let ctas = queries::ctas(
-        &cfg.table,
-        &cfg.query,
-        &boundaries,
-        cfg.expires_days,
-        cfg.null_json_deletes_row,
-    )?;
-    jobs.query(&cfg.billing_project, &ctas).await?;
+/// `Error::BqJob` renders a status as "{code} {reason}: {message}". These
+/// three on the schema probe are the user's query to fix, not a freighter
+/// failure. (Carrying the reason structurally on `Error` is a follow-up.)
+fn user_query_error(message: &str) -> bool {
+    ["400 invalidQuery:", "404 notFound:", "403 accessDenied:"]
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+}
+
+/// Steps 6 to 8, on the table once it exists: its counts, a row-size sample,
+/// and the largest bucket.
+async fn measure(
+    jobs: &BqJobs,
+    cfg: &PrepareConfig,
+    buckets: u32,
+) -> Result<(TableInfo, RowSizes, u64)> {
     // 6. Counts.
     let info = jobs.table(&cfg.table).await?.ok_or_else(|| {
         Error::BqJob(format!("{} was created but cannot be read back", cfg.table))
@@ -155,6 +112,106 @@ pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
         .query(&cfg.billing_project, &queries::max_bucket_rows(&cfg.table))
         .await?;
     let max_rows_per_bucket = queries::decode_max_bucket_rows(&largest)?;
+    Ok((info, sizes, max_rows_per_bucket))
+}
+
+/// Builds the source table and returns its record. Refuses (exit 2) before
+/// any scan when the table exists or the query's columns are wrong, and
+/// after the quantile scan when the query yields no rows.
+pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
+    // Before any scan: a count the CTAS would refuse must not cost a quantile pass.
+    if !(1..=MAX_BUCKETS).contains(&cfg.buckets) {
+        return Err(Error::Refused(format!(
+            "buckets must be between 1 and {MAX_BUCKETS}; got {}",
+            cfg.buckets
+        )));
+    }
+    // 1. Checked before the quantile pass, which scans the whole target.
+    if jobs.table(&cfg.table).await?.is_some() {
+        return Err(Error::Refused(format!(
+            "{} already exists; its boundaries also pre-split the Bigtable table, so drop it deliberately before rebuilding",
+            cfg.table
+        )));
+    }
+    // 2. Column types, for free. A query BigQuery rejects (400 invalidQuery:
+    // a missing column, a syntax error) is the user's to fix: exit 2.
+    let probe = match jobs
+        .query(&cfg.billing_project, &queries::schema_probe(&cfg.query))
+        .await
+    {
+        Ok(p) => p,
+        Err(Error::BqJob(m)) if user_query_error(&m) => {
+            return Err(Error::Refused(format!("the query is not valid: {m}")))
+        }
+        Err(e) => return Err(e),
+    };
+    queries::check_schema(&probe.schema)?;
+    // 3. Quantiles.
+    log::info!("prepare: scanning the query for {} quantiles", cfg.buckets);
+    let quantile_result = jobs
+        .query(
+            &cfg.billing_project,
+            &queries::quantiles(&cfg.query, cfg.buckets, cfg.null_json_deletes_row),
+        )
+        .await?;
+    let Some(q) = queries::decode_quantiles(&quantile_result)? else {
+        return Err(Error::Refused(
+            "the query yields no rows to load".to_owned(),
+        ));
+    };
+    // 4. Boundaries.
+    let boundaries = shard_boundaries(&q.cuts, &q.lowest, q.rows);
+    let buckets = u32::try_from(boundaries.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    log::info!(
+        "prepare: {} rows, {} buckets after thinning (asked for {}); {} bytes scanned",
+        q.rows,
+        buckets,
+        cfg.buckets,
+        quantile_result.total_bytes_processed
+    );
+    // 5. Build.
+    let ctas = queries::ctas(
+        &cfg.table,
+        &cfg.query,
+        &boundaries,
+        cfg.expires_days,
+        cfg.null_json_deletes_row,
+    )?;
+    log::info!(
+        "prepare: building {} ({} buckets, expires {})",
+        cfg.table,
+        buckets,
+        if cfg.expires_days == 0 {
+            "never".to_owned()
+        } else {
+            format!("in {} days", cfg.expires_days)
+        }
+    );
+    let ctas_result = jobs.query(&cfg.billing_project, &ctas).await?;
+    log::info!(
+        "prepare: built {} ({} bytes scanned)",
+        cfg.table,
+        ctas_result.total_bytes_processed
+    );
+    let (info, sizes, max_rows_per_bucket) =
+        measure(jobs, cfg, buckets).await.map_err(|e| match e {
+            Error::Refused(_) => e,
+            e => Error::BqJob(format!(
+                "{} was built, but measuring it failed: {e}; drop the table and rerun",
+                cfg.table
+            )),
+        })?;
+    let logical = info.num_bytes as f64 / info.num_rows as f64;
+    log::info!(
+        "prepare: {} rows; bytes per row logical {:.1}, gzip {:.1}, raw {:.1}; largest bucket {} rows",
+        info.num_rows,
+        logical,
+        sizes.gzip,
+        sizes.raw,
+        max_rows_per_bucket
+    );
     Ok(SourceRecord {
         version: SOURCE_RECORD_VERSION,
         table: cfg.table.path(),
@@ -165,7 +222,7 @@ pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
         boundaries,
         buckets,
         rows: info.num_rows,
-        logical_bytes_per_row: info.num_bytes as f64 / info.num_rows as f64,
+        logical_bytes_per_row: logical,
         gzip_bytes_per_row: sizes.gzip,
         raw_bytes_per_row: sizes.raw,
         max_rows_per_bucket,
@@ -177,9 +234,7 @@ pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::bqjobs::{Cell, Field, QueryResult, Row};
-    use crate::lookup::encode_value;
-    use crate::manifest::CellCompression;
+    use crate::bqjobs::{Cell, Field, Row};
 
     fn sample(rows: &[(&str, Option<&str>)]) -> QueryResult {
         QueryResult {
@@ -243,5 +298,9 @@ mod tests {
         let two = measure_row_sizes(&sample(&[("ab", None), ("abcd", None)])).unwrap();
         assert_eq!((two.gzip, two.raw), (3.0, 3.0));
         assert!(measure_row_sizes(&sample(&[])).is_err());
+        let mixed = measure_row_sizes(&sample(&[("ab", None), ("ab", Some("{}"))])).unwrap();
+        assert_eq!(mixed.raw, 3.0);
+        let encoded = encode_value(b"{}", CellCompression::Gzip).unwrap().len();
+        assert_eq!(mixed.gzip, (2 + (2 + encoded)) as f64 / 2.0);
     }
 }

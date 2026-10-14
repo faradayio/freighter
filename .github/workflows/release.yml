@@ -24,7 +24,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - if: matrix.zig
-        run: pip install ziglang cargo-zigbuild
+        uses: mlugg/setup-zig@v2
+      - if: matrix.zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
       - name: Build
         run: |
           if [ "${{ matrix.zig }}" = "true" ]; then
@@ -97,8 +101,10 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
 
+  # Last, and only once everything else succeeded: a crates.io publish can't
+  # be undone.
   crates-io:
-    needs: binaries
+    needs: [github-release, image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

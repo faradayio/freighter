@@ -82,8 +82,7 @@ The mover has two, one per vendor API, plus one shared policy module:
 
 Evaluated against a live `cbtemulator` (table + column family created with `cbt`,
 one cell written at an explicit timestamp, read back through a
-family → qualifier → timestamp-range → cells-per-column filter chain). Scratch
-crates were built under `/tmp` and are not committed.
+family → qualifier → timestamp-range → cells-per-column filter chain).
 
 | Criterion | `bigtable_rs` 0.4.0 | google-cloud-rust (`google-cloud-bigtable-admin-v2` 1.13.0) | `gcloud-sdk` 0.30.2 (`google-bigtable-v2`) |
 | --- | --- | --- | --- |

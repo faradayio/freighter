@@ -3,7 +3,8 @@
 # Credentials: GKE Workload Identity. Bind the Kubernetes service account to a
 # Google service account with roles/bigquery.readSessionUser (billing project),
 # roles/bigquery.dataViewer (source table), roles/bigtable.user (instance) and
-# object read + create on the manifest's GCS prefix. freighter finds the
+# roles/storage.objectViewer + objectCreator on the manifest's bucket
+# (objectUser if a re-run writes verdicts into a prefix that already has them). freighter finds the
 # credentials through the standard ADC chain; no key file is needed.
 #
 # Size memory from docs/sizing.md. requests == limits pins the pod to whole

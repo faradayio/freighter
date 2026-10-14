@@ -19,8 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Bigtable client, named only by src/client.rs (the swap boundary). Chosen
-# over gcloud-sdk / google-cloud-rust after an emulator bake-off; see "Client
-# crate decision" in README.md. ring, not the default aws-lc: one TLS crypto
+# over gcloud-sdk / google-cloud-rust after an emulator bake-off; see "Choosing
+# the Bigtable client" in docs/design.md. ring, not the default aws-lc: one TLS crypto
 # backend in the tree (gcp_auth and object_store's reqwest use ring too), and
 # no C/assembly build of aws-lc-sys.
 bigtable_rs = { version = "0.4.0", default-features = false, features = ["gcp-auth-ring", "tonic-tls-ring"] }
@@ -55,9 +55,14 @@ bytes = "1"
 # gzip for the `jsonz` cell value — the framing Java's GZIPOutputStream
 # writes. The default backend is pure Rust, so the build needs no C toolchain.
 flate2 = "1"
-# gcp-base + ring, not "gcp": that feature pulls aws-lc-rs as its crypto
-# backend, a second TLS stack with a C build.
-object_store = { version = "0.14", features = ["gcp-base", "ring"] }
+# gcp-base + ring + reqwest, not "gcp": that feature pulls aws-lc-rs as its
+# crypto backend, a second TLS stack with a C build. Without "reqwest" the GCS
+# builder has no HTTP transport and every gs:// manifest fails at startup.
+object_store = { version = "0.14", features = ["gcp-base", "ring", "reqwest"] }
+# object_store's HTTP client. reqwest's "rustls" feature would pull aws-lc;
+# rustls-no-provider plus the ring provider main.rs installs keeps one backend.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # BigQuery Storage Read. Version line differs from bigtable-v2 (0.34 vs
 # 0.39) but both resolve tonic ^0.14 / prost ^0.14 — ONE tonic in the tree.
 # Verify with `cargo tree -d` after any bump.

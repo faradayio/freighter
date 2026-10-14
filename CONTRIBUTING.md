@@ -43,7 +43,10 @@ lints it by name.
 
 ## Releasing
 
-1. Move the `Unreleased` notes in `CHANGELOG.md` under the new version.
+1. Move the `Unreleased` notes in `CHANGELOG.md` under the new version,
+   dated the day you tag.
 2. Bump `version` in `freighter/Cargo.toml`.
 3. Tag `vX.Y.Z` and push the tag. The release workflow builds binaries and the
-   container image, publishes to crates.io, and creates the GitHub release.
+   container image, creates the GitHub release, then publishes to crates.io.
+4. First release only: set the `ghcr.io/faradayio/freighter` package's
+   visibility to public (new organization packages start private).

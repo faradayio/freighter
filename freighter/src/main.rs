@@ -60,6 +60,9 @@ fn store_for(uri: &str) -> Result<(Arc<dyn ObjectStore>, Path), String> {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // object_store's reqwest is built without a crypto provider (Cargo.toml),
+    // so rustls needs a process default before the first GCS request.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let uri = match std::env::args().nth(1) {
         Some(u) => u,
         None => {
@@ -100,7 +103,7 @@ fn main() {
             }) {
             Ok(m) => m,
             Err(e) => {
-                log::error!("manifest: {e}");
+                log::error!("{e}");
                 return 2;
             }
         };
@@ -113,4 +116,17 @@ fn main() {
         }
     });
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_for;
+
+    #[test]
+    fn a_gs_manifest_uri_builds_a_store() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_, name) = store_for("gs://bucket/loads/1/manifest.json")
+            .unwrap_or_else(|e| panic!("gs:// store: {e}"));
+        assert_eq!(name.as_ref(), "manifest.json");
+    }
 }

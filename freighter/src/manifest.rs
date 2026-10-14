@@ -1,8 +1,6 @@
-//! The launcher <-> mover contract: versioned JSON in (manifest), JSON out
-//! (per-shard verdicts). Field names ARE the contract; the Python launcher
-//! renders these dicts directly (no dataclass mirror — Rust is the only
-//! validator) and both sides pin
-//! fixtures/freighter-lookup-manifest-example.json.
+//! The caller <-> mover contract: versioned JSON in (manifest), JSON out
+//! (per-shard verdicts). Field names ARE the contract, this module is its only
+//! validator, and fixtures/freighter-lookup-manifest-example.json pins it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -101,9 +99,9 @@ pub struct MoveManifest {
     pub bt_instance: String,
     pub destination_table: String,
     pub app_profile: String,
-    /// Launcher-ordered.
+    /// Caller-ordered.
     pub shards: Vec<ShardSpec>,
-    /// Always picked explicitly by the launcher; 0/server-pick is not part
+    /// Always picked explicitly by the caller; 0/server-pick is not part
     /// of this contract.
     pub read_streams: i32,
     pub flush_cells: usize,
@@ -112,7 +110,7 @@ pub struct MoveManifest {
     /// multiplies the server queue as flush_cells grows.
     pub inflight_mutations: usize,
     /// The one timestamp every cell of a load carries, picked once by the
-    /// launcher: a relaunched shard re-writes the same cells at the same
+    /// caller: a relaunched shard re-writes the same cells at the same
     /// timestamp, which is what makes the rewrite idempotent.
     pub cell_timestamp_micros: i64,
     /// A source row whose json is NULL deletes its Bigtable row. When false,
@@ -275,7 +273,7 @@ impl MoveManifest {
         }
         if m.read_streams <= 0 {
             return Err(Error::Manifest(format!(
-                "read_streams {} must be positive — the launcher always picks explicitly",
+                "read_streams {} must be positive — pick the stream count explicitly",
                 m.read_streams
             )));
         }

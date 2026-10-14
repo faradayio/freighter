@@ -1,7 +1,7 @@
 # Verdict reference
 
 After each shard the mover writes `shard_<index:04>.json` beside the manifest.
-An example is at [fixtures/freighter-verdict-example.json](../fixtures/freighter-verdict-example.json).
+An example is at [freighter/fixtures/freighter-verdict-example.json](../freighter/fixtures/freighter-verdict-example.json).
 
 The mover reports; it does not judge whether the load is complete. That is
 [verification](verifying-a-load.md).
@@ -30,7 +30,7 @@ The mover reports; it does not judge whether the load is complete. That is
   `null_json_deletes_row`)
 
 A shard that errors out (a read error, an unexpected empty shard, a write
-error that ends the shard) gets a `failed` verdict with every count at zero,
+error that ends the shard) gets a `failed` verdict with every count and timing at zero,
 even if some of its cells had already landed. A shard that finishes writing
 with `cells_failed > 0` gets a `failed` verdict with real counts.
 
@@ -55,7 +55,7 @@ with `cells_failed > 0` gets a `failed` verdict with real counts.
 | `write_seconds` | first slice sent → last acknowledged |
 | `stalled_seconds` | time spent waiting out silent streams before re-opening them |
 | `wall_seconds` | read session opened → last acknowledged |
-| `latency_ms_p50`, `latency_ms_p99` | `MutateRows` latency |
+| `latency_ms_p50`, `latency_ms_p99` | latency per slice, including its retries |
 
 A lane reads its next shard while writing the current one, so `wall_seconds`
 includes time the read shard waited for the previous write. Rate a shard by

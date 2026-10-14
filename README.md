@@ -71,19 +71,25 @@ The manifest (`gs://` or `file://`) says what to read, where to write, and how
 to cut the work. Verdicts land next to it as `shard_0000.json`,
 `shard_0001.json`, …
 
-Exit codes: `2` when the manifest could not be read or was refused; `1` when a
-lane stopped (three consecutive failed shards in one lane) or a verdict could
-not be written; `0` otherwise. **Exit 0 does not mean every shard landed** — a
+Exit codes: `2` when the manifest could not be read or was refused; `1` when the
+BigQuery or Bigtable connection could not be opened, a lane stopped (three
+consecutive failed shards in one lane), or a verdict could not be written; `0`
+otherwise. **Exit 0 does not mean every shard landed** — a
 lone failed shard gets a `failed` verdict and its lane moves on. The verdicts,
 checked against the source, are the only success criterion
 ([docs/verifying-a-load.md](docs/verifying-a-load.md)).
 
-Credentials come from the standard Application Default Credentials chain:
-`GOOGLE_APPLICATION_CREDENTIALS`, your gcloud login, or GKE Workload Identity.
+Credentials come from Application Default Credentials:
+`GOOGLE_APPLICATION_CREDENTIALS` pointing at a service-account key, the file
+`gcloud auth application-default login` writes, or the GKE metadata server
+(Workload Identity). Workload Identity Federation credential files
+(`external_account`) are not supported for the manifest's GCS access yet.
 The identity needs `roles/bigquery.readSessionUser` on the billing project,
 `roles/bigquery.dataViewer` on the source table, `roles/bigtable.user` on the
-instance, and read plus create on the manifest's GCS prefix (verdicts are
-written there).
+instance, and `roles/storage.objectViewer` plus `roles/storage.objectCreator`
+on the manifest's bucket. Verdicts are written beside the manifest; if you
+re-run into a prefix that already holds verdicts, overwriting them also needs
+delete, so use `roles/storage.objectUser` there.
 
 [examples/k8s/job.yaml](examples/k8s/job.yaml) runs it as a Kubernetes Job.
 
@@ -92,14 +98,14 @@ written there).
 Against the Bigtable emulator, with a source table you own:
 
 ```bash
-gcloud components install bigtable cbt
+gcloud components install beta bigtable cbt
 gcloud beta emulators bigtable start --host-port=localhost:8086 &
 export BIGTABLE_EMULATOR_HOST=localhost:8086
 cbt -project example-project -instance example-instance createtable example_table
 cbt -project example-project -instance example-instance createfamily example_table data
 
 # Build a source table (docs/preparing-a-source-table.md), point a copy of
-# fixtures/freighter-lookup-manifest-example.json at it, then:
+# freighter/fixtures/freighter-lookup-manifest-example.json at it, then:
 freighter file://$PWD/manifest.json
 cat shard_0000.json
 cbt -project example-project -instance example-instance count example_table

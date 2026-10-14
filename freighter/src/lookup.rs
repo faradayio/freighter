@@ -188,13 +188,13 @@ mod tests {
     }
 
     /// An ordered shard keeps every gzipped value resident until it is
-    /// written, and the launcher sizes shards from the value's LENGTH. Spare
+    /// written, and the caller sizes shards from the value's LENGTH. Spare
     /// capacity left by the encoder's growing buffer is memory the plan never
     /// counted: at ~2 KB values it doubled the pod's residency and OOM-killed
     /// a load sized to fit.
     #[test]
     fn a_gzipped_value_holds_no_spare_capacity() {
-        // ~6 KB of poorly compressible JSON, like a wide attribute-cache row.
+        // ~6 KB of poorly compressible JSON, like a wide entity record.
         let mut state = 0x2545_f491_4f6c_dd1d_u64;
         let mut json = String::from("[");
         while json.len() < 6_000 {

@@ -124,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn retryable_classifies_the_d3_table() {
+    fn retryable_splits_transient_from_fatal_codes() {
         use tonic::Code;
         for c in [
             Code::Unavailable,

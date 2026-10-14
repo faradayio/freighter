@@ -164,8 +164,8 @@ where
 }
 
 /// Ok iff every lane completed; otherwise one error naming every tripped
-/// and failed lane — the pod exits non-zero and the harness's verify-first
-/// relaunch picks up the unverdicted shards.
+/// and failed lane — the pod exits non-zero, and the caller re-runs the
+/// shards without a clean verdict.
 fn lanes_result(outcomes: Vec<LaneOutcome>) -> Result<()> {
     let mut tripped = Vec::new();
     let mut failed = Vec::new();

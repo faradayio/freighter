@@ -105,7 +105,7 @@ fn finish_shard(counters: Arc<Counters>, expect_empty: bool) -> Result<Counters>
         );
     }
     // Hard error, never a silent default: a zeroed Counters would produce
-    // a verdict with acknowledged=0, the launcher's count check would then
+    // a verdict with acknowledged=0, the caller's count check would then
     // fail forever, and the shard would re-run in a loop. All write tasks
     // are joined inside write_sorted, so this succeeds by construction —
     // the error is the tripwire for that invariant breaking.
@@ -388,7 +388,7 @@ fn failed_verdict(m: &MoveManifest, shard: &ShardSpec, e: &Error) -> ShardVerdic
 /// budget, then walk the manifest's lanes (all parallelism is intra-shard,
 /// across lanes, and a lane's next read against its current write). Each
 /// shard's verdict uploads as it completes; per-shard failures become
-/// Failed verdicts (the ledger/fence quarantines them); a tripped or
+/// Failed verdicts (the caller re-runs them); a tripped or
 /// failed lane stops itself; the pod exits non-zero at the end if any lane
 /// did not complete.
 pub async fn run_move(m: MoveManifest, store: Arc<dyn ObjectStore>) -> Result<()> {
@@ -444,7 +444,7 @@ async fn upload_verdict(store: &Arc<dyn ObjectStore>, v: &ShardVerdict) -> Resul
 #[allow(clippy::unwrap_used)] // tests; the workspace denies unwrap_used
 mod tests {
     const LOOKUP_MANIFEST_FIXTURE: &str =
-        include_str!("../../fixtures/freighter-lookup-manifest-example.json");
+        include_str!("../fixtures/freighter-lookup-manifest-example.json");
 
     #[test]
     fn shard_restriction_is_built_on_the_range_column() {

@@ -8,7 +8,7 @@
   "row_deletes_acknowledged": 62,
   "row_deletes_failed": 0,
   "entry_retries": 3,
-  "entries": 124903,
+  "entries": 6245162,
   "requests": 2498,
   "read_reopens": 1,
   "rpc_retries": 2,

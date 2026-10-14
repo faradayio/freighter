@@ -329,7 +329,7 @@ impl BqReader {
     /// (re)open primes a FRESH decoder with the session schema so a resumed
     /// stream can never inherit half a message. `READ_REOPEN_LIMIT` bounds
     /// the re-opens taken in a row without a row delivered; past it the
-    /// slice fails and the fence re-runs it. A status re-open backs off by
+    /// slice fails and the caller re-runs it. A status re-open backs off by
     /// that same consecutive count.
     ///
     /// BigQuery answers ReadRows at offset == the stream's row count with an

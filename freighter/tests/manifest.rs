@@ -3,8 +3,8 @@
 use freighter::manifest::{MoveManifest, Outcome, ShardVerdict};
 
 const LOOKUP_MANIFEST_FIXTURE: &str =
-    include_str!("../../fixtures/freighter-lookup-manifest-example.json");
-const VERDICT_FIXTURE: &str = include_str!("../../fixtures/freighter-verdict-example.json");
+    include_str!("../fixtures/freighter-lookup-manifest-example.json");
+const VERDICT_FIXTURE: &str = include_str!("../fixtures/freighter-verdict-example.json");
 
 /// The lookup fixture with `from` swapped for `to`; panics when `from` is
 /// absent, so a test can never run against the unmodified fixture.
@@ -28,7 +28,7 @@ fn verdict_serializes_to_the_fixture() {
         row_deletes_acknowledged: 62,
         row_deletes_failed: 0,
         entry_retries: 3,
-        entries: 124_903,
+        entries: 6_245_162,
         requests: 2498,
         read_reopens: 1,
         rpc_retries: 2,

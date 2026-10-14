@@ -2,7 +2,7 @@
 
 A manifest is one JSON object. Unknown fields are refused (except inside a
 shard's `range`), and the mover is its only validator. A complete example
-lives at [fixtures/freighter-lookup-manifest-example.json](../fixtures/freighter-lookup-manifest-example.json).
+lives at [freighter/fixtures/freighter-lookup-manifest-example.json](../freighter/fixtures/freighter-lookup-manifest-example.json).
 
 The current version is **3**. A manifest with any other `version` is refused
 before the rest is parsed.

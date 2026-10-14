@@ -74,8 +74,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 googleapis-tonic-google-cloud-bigquery-storage-v1 = "0.34"
 tonic = { version = "0.14", features = ["transport", "tls-native-roots", "tls-ring"] }
 gcp_auth = "0.12"
-# Command-line parsing for the binary only; the library exposes FromStr and
-# parse functions and never names clap.
+# Used by the binary only (cli.rs); the library's API never names clap. It
+# still compiles for library users — making it optional is not worth a
+# feature today.
 clap = { version = "4.6", features = ["derive"] }
 # requestId on every jobs.query submit, so a retried POST dedupes against the
 # job BigQuery already started instead of launching a second CTAS.

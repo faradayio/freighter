@@ -1,6 +1,10 @@
 [workspace]
 members = ["freighter"]
-resolver = "2"
+# Resolver 3 honours the crate's rust-version when picking dependency
+# versions: a release whose own rust-version is newer is skipped for an
+# older one (uuid 1.28 needs 1.89; the crate promises 1.88). Needs cargo
+# 1.84+, under the 1.88 floor.
+resolver = "3"
 
 [workspace.package]
 edition = "2021"

@@ -1,5 +1,0 @@
-# Dependency resolution respects freighter/Cargo.toml's rust-version: a
-# dependency whose own rust-version is newer than 1.88 is skipped in favour
-# of an older release, so `cargo +1.88 build --locked` keeps passing.
-[resolver]
-incompatible-rust-versions = "fallback"

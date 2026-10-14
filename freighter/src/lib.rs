@@ -3,6 +3,7 @@
 //! The mover is deliberately dumb — it moves rows and reports counts;
 //! policy lives in whatever launches it.
 
+pub mod bqjobs;
 pub mod bqread;
 pub mod cells;
 pub mod client;

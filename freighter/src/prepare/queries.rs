@@ -1,8 +1,9 @@
 //! The SQL `prepare` runs, each builder beside the decoder of its result so
-//! a query's column order and the code reading it stay together. Matches the
-//! reference implementation's SQL. Pure: no I/O.
+//! a query's column order and the code reading it stay together. The SQL
+//! shapes here are the ones run in production at Faraday. Pure: no I/O.
 
 use crate::bqjobs::{Field, QueryResult};
+use crate::cells::JSON_COLUMN;
 use crate::error::{Error, Result};
 use crate::source::TableRef;
 
@@ -13,8 +14,14 @@ use super::boundaries::MAX_BUCKETS;
 const MAX_QUERY_BYTES: usize = 1_000_000;
 
 pub const KEY: &str = "key";
-pub const JSON: &str = "json";
 pub const BUCKET: &str = "bucket";
+
+/// `boundaries.len() + 1`: the buckets a cut makes.
+pub(crate) fn bucket_count(boundaries: &[String]) -> u32 {
+    u32::try_from(boundaries.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
 
 /// A GoogleSQL single-quoted string literal.
 pub fn string_literal(s: &str) -> String {
@@ -36,27 +43,27 @@ pub fn string_literal(s: &str) -> String {
 }
 
 /// With `null_json_deletes_row` a NULL json is a row delete and must be kept.
-pub fn row_filter(null_json_deletes_row: bool) -> &'static str {
+pub fn row_filter(null_json_deletes_row: bool) -> String {
     if null_json_deletes_row {
-        "WHERE key IS NOT NULL"
+        format!("WHERE {KEY} IS NOT NULL")
     } else {
-        "WHERE key IS NOT NULL AND json IS NOT NULL"
+        format!("WHERE {KEY} IS NOT NULL AND {JSON_COLUMN} IS NOT NULL")
     }
 }
 
 /// `LIMIT 0` bills nothing and returns the column types.
 pub fn schema_probe(target_sql: &str) -> String {
-    format!("SELECT key, json FROM (\n{target_sql}\n) LIMIT 0")
+    format!("SELECT {KEY}, {JSON_COLUMN} FROM (\n{target_sql}\n) LIMIT 0")
 }
 
 /// Both columns present and `STRING`. A native `JSON` column or an `INT64`
 /// key would pass `prepare` and `plan` and fail every shard at decode.
 pub fn check_schema(schema: &[Field]) -> Result<()> {
-    for name in [KEY, JSON] {
+    for name in [KEY, JSON_COLUMN] {
         match schema.iter().find(|f| f.name == name) {
             None => {
                 return Err(Error::Refused(format!(
-                    "the query has no {name} column; freighter needs `{KEY} STRING, {JSON} STRING`"
+                    "the query has no {name} column; freighter needs `{KEY} STRING, {JSON_COLUMN} STRING`"
                 )))
             }
             Some(f) if f.mode.as_deref() == Some("REPEATED") => {
@@ -82,7 +89,7 @@ pub fn check_schema(schema: &[Field]) -> Result<()> {
 /// is how emptiness is detected.
 pub fn quantiles(target_sql: &str, buckets: u32, null_json_deletes_row: bool) -> String {
     format!(
-        "SELECT APPROX_QUANTILES(key, {buckets}) AS cuts, MIN(key) AS lowest,\n       COUNT(*) AS row_count\nFROM (\n{target_sql}\n)\n{}\n",
+        "SELECT APPROX_QUANTILES({KEY}, {buckets}) AS cuts, MIN({KEY}) AS lowest,\n       COUNT(*) AS row_count\nFROM (\n{target_sql}\n)\n{}\n",
         row_filter(null_json_deletes_row)
     )
 }
@@ -130,9 +137,7 @@ pub fn ctas(
     expires_days: u32,
     null_json_deletes_row: bool,
 ) -> Result<String> {
-    let buckets = u32::try_from(boundaries.len())
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
+    let buckets = bucket_count(boundaries);
     if buckets > MAX_BUCKETS {
         return Err(Error::Refused(format!(
             "{buckets} buckets exceeds the {MAX_BUCKETS} partitions one CREATE TABLE AS job may write"
@@ -151,7 +156,7 @@ pub fn ctas(
         )
     };
     let sql = format!(
-        "CREATE TABLE {}\nPARTITION BY RANGE_BUCKET({BUCKET}, GENERATE_ARRAY(0, {buckets}, 1))\nCLUSTER BY {KEY}\n{options}AS\nSELECT {KEY}, {JSON}, RANGE_BUCKET({KEY}, ARRAY<STRING>[{literals}]) AS {BUCKET}\nFROM (\n{target_sql}\n)\n{}\n",
+        "CREATE TABLE {}\nPARTITION BY RANGE_BUCKET({BUCKET}, GENERATE_ARRAY(0, {buckets}, 1))\nCLUSTER BY {KEY}\n{options}AS\nSELECT {KEY}, {JSON_COLUMN}, RANGE_BUCKET({KEY}, ARRAY<STRING>[{literals}]) AS {BUCKET}\nFROM (\n{target_sql}\n)\n{}\n",
         table.sql(),
         row_filter(null_json_deletes_row)
     );
@@ -182,7 +187,7 @@ pub fn sample(table: &TableRef, buckets: &[u32], rows_per_bucket: u32) -> String
         .iter()
         .map(|b| {
             format!(
-                "(SELECT {KEY}, {JSON} FROM {} WHERE {BUCKET} = {b} LIMIT {rows_per_bucket})",
+                "(SELECT {KEY}, {JSON_COLUMN} FROM {} WHERE {BUCKET} = {b} LIMIT {rows_per_bucket})",
                 table.sql()
             )
         })

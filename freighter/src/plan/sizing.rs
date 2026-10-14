@@ -9,17 +9,17 @@ use crate::source::SourceRecord;
 /// RowWrite and CellWrite structs, five small heap allocations with
 /// allocator overhead and rounding, and up to ~96 B while the shard's row
 /// Vec grows. About 300 B, derived, not measured.
-pub const RESIDENT_ROW_OVERHEAD_BYTES: f64 = 320.0;
+pub(crate) const RESIDENT_ROW_OVERHEAD_BYTES: f64 = 320.0;
 /// Run-to-run spread of mover peak memory at identical resident size.
-pub const RESIDENCY_SAFETY: f64 = 1.3;
+pub(crate) const RESIDENCY_SAFETY: f64 = 1.3;
 /// A lane reads its next shard while it writes the current one, so two
 /// whole shards are resident per lane at once.
-pub const RESIDENT_SHARDS_PER_LANE: u32 = 2;
+pub(crate) const RESIDENT_SHARDS_PER_LANE: u32 = 2;
 /// Runtime and gRPC channels.
-pub const RESIDENCY_FIXED_BYTES: f64 = 1_000_000_000.0;
+pub(crate) const RESIDENCY_FIXED_BYTES: f64 = 1_000_000_000.0;
 /// The in-flight budget counts twice: a slice's decoded rows and its
 /// serialized request are both resident until the RPC returns.
-pub const INFLIGHT_COPIES: f64 = 2.0;
+pub(crate) const INFLIGHT_COPIES: f64 = 2.0;
 /// Storage Read streams across the pod; each lane's session gets an equal
 /// share so decode (gzip) parallelism does not grow with the lane count.
 pub const POD_READ_STREAMS: i32 = 32;
@@ -39,7 +39,7 @@ pub struct SizingConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadPlan {
+pub(crate) struct LoadPlan {
     /// Inclusive (lo, hi) bucket ranges, ascending, covering 0..rung once.
     pub shard_ranges: Vec<(i64, i64)>,
     pub lanes: u32,
@@ -74,7 +74,7 @@ pub fn parse_memory(s: &str) -> Result<u64> {
 /// One MutateRows request in flight per lane: the mover admits requests
 /// against ONE pod-wide semaphore of this many permits, so
 /// `inflight_mutations / flush_cells` IS the pod's request concurrency.
-pub fn inflight_mutations(flush_cells: usize, lanes: u32) -> usize {
+pub(crate) fn inflight_mutations(flush_cells: usize, lanes: u32) -> usize {
     flush_cells * lanes as usize
 }
 
@@ -84,21 +84,15 @@ pub fn inflight_mutations(flush_cells: usize, lanes: u32) -> usize {
 /// BigQuery's logical size. A shard is sized as if every bucket in it were
 /// the LARGEST bucket: the mover runs out of memory on the biggest shard,
 /// not the average one.
-pub fn plan_load(source: &SourceRecord, cfg: &SizingConfig) -> Result<LoadPlan> {
+pub(crate) fn plan_load(source: &SourceRecord, cfg: &SizingConfig) -> Result<LoadPlan> {
     if cfg.lanes < 1 {
         return Err(Error::Refused(format!(
             "lanes {} must be positive",
             cfg.lanes
         )));
     }
+    source.validate()?;
     let row_bytes = source.row_bytes(cfg.compression);
-    // `from_json` checks this too, but a record built by hand (the tests do)
-    // bypasses it; NaN must be refused here as well.
-    if !(row_bytes.is_finite() && row_bytes > 0.0) {
-        return Err(Error::Refused(format!(
-            "bytes per row {row_bytes} must be positive: the source's row size was not measured"
-        )));
-    }
     if cfg.read_streams <= 0 {
         return Err(Error::Refused(format!(
             "read_streams {} must be positive",

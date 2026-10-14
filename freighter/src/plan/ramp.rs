@@ -52,7 +52,7 @@ impl FromStr for Ramp {
 
 #[derive(Debug, Clone, PartialEq)]
 /// One ramp step: its lanes (the ladder's rung, capped at the step's shard count) and its shards, lane-major.
-pub struct RampStep {
+pub(crate) struct RampStep {
     pub index: usize,
     pub lanes: u32,
     /// Lane-major, each lane's ranges ascending — what the mover's lane
@@ -71,7 +71,7 @@ pub struct RampStep {
 /// and the lanes' cursors sit in distant regions. Round-robin would park
 /// every cursor in neighbouring tablets, so one tablet server takes every
 /// lane's writes at once.
-pub fn plan_ramp(plan: &LoadPlan, ramp: &Ramp) -> Result<Vec<RampStep>> {
+pub(crate) fn plan_ramp(plan: &LoadPlan, ramp: &Ramp) -> Result<Vec<RampStep>> {
     let fractions = ramp.fractions();
     let ladder = [1, (plan.lanes / 2).max(1), plan.lanes];
     let step_lanes = &ladder[ladder.len() - fractions.len()..];

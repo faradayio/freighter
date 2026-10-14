@@ -25,6 +25,8 @@ follows [Semantic Versioning](https://semver.org/).
 - `freighter move <uri>` is the documented spelling; `freighter <uri>` still works.
 - Library: `cells::TableConfig` gains `qualifier` and `compression`, so code
   that builds it by struct literal must add them.
+- Library: `manifest::MoveManifest` gains `qualifier` and `compression`
+  (struct-literal constructions must add them); `MOVE_MANIFEST_VERSION` is 4.
 
 ## [0.1.0] - 2026-10-14
 

@@ -12,9 +12,10 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use serde::{Deserialize, Serialize};
 
 use crate::bqjobs::BqJobs;
+use crate::cells::JSON_COLUMN;
 use crate::error::{Error, Result};
-use crate::manifest::{MoveManifest, Outcome, ShardRange, ShardSpec, ShardVerdict};
-use crate::source::TableRef;
+use crate::manifest::{verdict_index, MoveManifest, Outcome, ShardRange, ShardSpec, ShardVerdict};
+use crate::source::{plain_identifier, TableRef};
 
 pub const VERIFY_REPORT_VERSION: u32 = 1;
 
@@ -46,39 +47,25 @@ pub struct Problem {
 /// A source bucket's rows by what the mover does with them: sets (one cell
 /// each) and deletes (NULL json).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BucketRows {
+pub(crate) struct BucketRows {
     pub sets: u64,
     pub deletes: u64,
 }
 
-/// `shard_<digits>.json` -> the index. Anything else beside the manifest
-/// (the manifest itself, a step directory) is not a verdict.
-pub fn verdict_index(file_name: &str) -> Option<u32> {
-    let digits = file_name.strip_prefix("shard_")?.strip_suffix(".json")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
 /// The grouped count over the shards' bucket span. `range_column` is user
 /// input from the manifest on its first trip into SQL: backtick-quoted, and
-/// a name containing a backtick is refused.
-pub fn count_sql(table: &TableRef, range_column: &str, lo: i64, hi: i64) -> Result<String> {
-    if range_column.contains('`') || range_column.is_empty() {
-        return Err(Error::Refused(format!(
-            "range_column {range_column:?} is not a plain column name"
-        )));
-    }
+/// refused unless it is a plain identifier.
+pub(crate) fn count_sql(table: &TableRef, range_column: &str, lo: i64, hi: i64) -> Result<String> {
+    plain_identifier(range_column, "range_column", false)?;
     Ok(format!(
-        "SELECT `{range_column}` AS bucket,\n       COUNTIF(json IS NOT NULL) AS set_count,\n       COUNTIF(json IS NULL) AS delete_count\nFROM {}\nWHERE `{range_column}` BETWEEN {lo} AND {hi}\nGROUP BY bucket\n",
+        "SELECT `{range_column}` AS bucket,\n       COUNTIF({JSON_COLUMN} IS NOT NULL) AS set_count,\n       COUNTIF({JSON_COLUMN} IS NULL) AS delete_count\nFROM {}\nWHERE `{range_column}` BETWEEN {lo} AND {hi}\nGROUP BY bucket\n",
         table.sql()
     ))
 }
 
 /// One problem per way the verdicts disagree with the source's rows per
 /// bucket, in manifest order; stray verdict indexes sorted.
-pub fn count_problems(
+pub(crate) fn count_problems(
     shards: &[ShardSpec],
     per_bucket: &BTreeMap<i64, BucketRows>,
     verdicts: &[ShardVerdict],
@@ -399,16 +386,6 @@ mod tests {
         assert!(!report.ok);
         assert!(report.problems.is_empty());
         assert_eq!(report.stray_verdicts, [7, 9]);
-    }
-
-    #[test]
-    fn verdict_files_are_recognised_by_name() {
-        assert_eq!(verdict_index("shard_0004.json"), Some(4));
-        assert_eq!(verdict_index("shard_12345.json"), Some(12345));
-        assert_eq!(verdict_index("manifest.json"), None);
-        assert_eq!(verdict_index("shard_.json"), None);
-        assert_eq!(verdict_index("shard_0004.json.bak"), None);
-        assert_eq!(verdict_index("shard_x.json"), None);
     }
 
     #[test]

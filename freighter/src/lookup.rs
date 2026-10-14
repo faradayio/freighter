@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use crate::cells::{col, refuse_null_slots, TableConfig};
+use crate::cells::{col, refuse_null_slots, TableConfig, JSON_COLUMN};
 use crate::client::{CellWrite, RowChange, RowWrite};
 use crate::error::{Error, Result};
 use crate::manifest::CellCompression;
@@ -15,8 +15,6 @@ use arrow_array::RecordBatch;
 use arrow_array::StringArray;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-
-const JSON_COLUMN: &str = "json";
 
 /// The Storage Read column list for a lookup source table. The shard
 /// `range_column` is restricted on, never projected.

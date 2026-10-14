@@ -1,7 +1,8 @@
 //! `freighter plan`: size one load from a source record and render its
 //! manifests, one per ramp step, each passed through the mover's own
-//! validator before it is returned. `sizing` and `ramp` are pure ports of
-//! the reference implementation; so is `plan` — the clock is read by the caller.
+//! validator before it is returned. `sizing` and `ramp` are the arithmetic
+//! run in production at Faraday. All three are pure: the caller reads the
+//! clock.
 
 pub mod ramp;
 pub mod sizing;

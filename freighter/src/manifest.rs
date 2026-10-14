@@ -196,6 +196,22 @@ impl std::fmt::Display for Outcome {
     }
 }
 
+/// The file a shard's verdict lands in, beside the manifest.
+pub(crate) fn verdict_file_name(index: u32) -> String {
+    format!("shard_{index:04}.json")
+}
+
+/// `shard_<digits>.json` -> the index; the inverse of `verdict_file_name`,
+/// which also takes unpadded digits. Anything else beside the manifest (the
+/// manifest itself, a step directory) is not a verdict.
+pub(crate) fn verdict_index(file_name: &str) -> Option<u32> {
+    let digits = file_name.strip_prefix("shard_")?.strip_suffix(".json")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// A mover's verdict on one shard: outcome, row/cell counts, latencies, and resilience counters.
 ///
 /// Deliberately no `deny_unknown_fields`: a verdict from a newer mover may carry
@@ -318,10 +334,14 @@ impl MoveManifest {
         let probe: VersionProbe =
             serde_json::from_str(doc).map_err(|e| Error::Manifest(format!("parse: {e}")))?;
         if !SUPPORTED_MANIFEST_VERSIONS.contains(&probe.version) {
-            // Keep in step with SUPPORTED_MANIFEST_VERSIONS.
             return Err(Error::Manifest(format!(
-                "version {} unsupported; this mover understands 3 or 4",
-                probe.version
+                "version {} unsupported; this mover understands {}",
+                probe.version,
+                SUPPORTED_MANIFEST_VERSIONS
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
             )));
         }
         let m: MoveManifest =
@@ -333,8 +353,9 @@ impl MoveManifest {
         for shard in &m.shards {
             if !seen.insert(shard.index) {
                 return Err(Error::Manifest(format!(
-                    "duplicate shard index {} — verdicts land at shard_{:04}.json and would overwrite",
-                    shard.index, shard.index
+                    "duplicate shard index {} — verdicts land at {} and would overwrite",
+                    shard.index,
+                    verdict_file_name(shard.index)
                 )));
             }
             let ShardRange::Int { lo, hi } = shard.range;
@@ -367,7 +388,7 @@ impl MoveManifest {
         // `flush_cells` rows is that many of each.
         if m.flush_cells == 0 || m.flush_cells > MAX_FLUSH_CELLS {
             return Err(Error::Manifest(format!(
-                "flush_cells {} outside (0, 90000] — stay below the 100k mutation limit",
+                "flush_cells {} outside (0, {MAX_FLUSH_CELLS}] — stay below the 100k mutation limit",
                 m.flush_cells
             )));
         }
@@ -379,5 +400,21 @@ impl MoveManifest {
         }
         validate_lanes(&m.shards)?;
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_files_are_recognised_by_name() {
+        assert_eq!(verdict_file_name(4), "shard_0004.json");
+        assert_eq!(verdict_index(&verdict_file_name(4)), Some(4));
+        assert_eq!(verdict_index("shard_12345.json"), Some(12345));
+        assert_eq!(verdict_index("manifest.json"), None);
+        assert_eq!(verdict_index("shard_.json"), None);
+        assert_eq!(verdict_index("shard_0004.json.bak"), None);
+        assert_eq!(verdict_index("shard_x.json"), None);
     }
 }

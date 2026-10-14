@@ -64,7 +64,8 @@ flate2 = "1"
 # crypto backend, a second TLS stack with a C build. Without "reqwest" the GCS
 # builder has no HTTP transport and every gs:// manifest fails at startup.
 object_store = { version = "0.14", features = ["gcp-base", "ring", "reqwest"] }
-# object_store's HTTP client. reqwest's "rustls" feature would pull aws-lc;
+# HTTP client for object_store's GCS backend and for the BigQuery jobs API
+# (bqjobs.rs). reqwest's "rustls" feature would pull aws-lc;
 # rustls-no-provider plus the ring provider main.rs installs keeps one backend.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

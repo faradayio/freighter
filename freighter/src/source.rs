@@ -24,7 +24,7 @@ pub struct TableRef {
 /// A part safe to quote in SQL and to push as a REST path segment. `.` and
 /// `..` are refused even where dots are allowed: the url crate drops those
 /// segments silently, and the call would address another resource.
-pub fn plain_identifier(part: &str, what: &str, allow_dot: bool) -> Result<()> {
+pub(crate) fn plain_identifier(part: &str, what: &str, allow_dot: bool) -> Result<()> {
     let bad = part.is_empty()
         || part == "."
         || part == ".."
@@ -147,6 +147,14 @@ impl SourceRecord {
         }
         let s: SourceRecord =
             serde_json::from_str(doc).map_err(|e| Error::Source(format!("parse: {e}")))?;
+        s.validate()?;
+        Ok(s)
+    }
+
+    /// The record's invariants. `from_json` applies them; `plan` applies them
+    /// again, since a record built in code never passed through `from_json`.
+    pub fn validate(&self) -> Result<()> {
+        let s = self;
         TableRef::from_path(&s.table).map_err(|e| Error::Source(e.to_string()))?;
         if s.buckets as usize != s.boundaries.len() + 1 {
             return Err(Error::Source(format!(
@@ -197,7 +205,7 @@ impl SourceRecord {
                 "range_column must differ from rowkey_column".to_owned(),
             ));
         }
-        Ok(s)
+        Ok(())
     }
 
     pub fn to_json(&self) -> Result<String> {

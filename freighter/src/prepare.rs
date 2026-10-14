@@ -3,7 +3,7 @@
 //! the cut is `boundaries`, the SQL is `queries`, both pure.
 
 pub mod boundaries;
-pub mod queries;
+pub(crate) mod queries;
 
 use crate::bqjobs::{BqJobs, QueryResult, TableInfo};
 use crate::error::{Error, Result};
@@ -164,9 +164,7 @@ pub async fn run(jobs: &BqJobs, cfg: &PrepareConfig) -> Result<SourceRecord> {
     };
     // 4. Boundaries.
     let boundaries = shard_boundaries(&q.cuts, &q.lowest, q.rows);
-    let buckets = u32::try_from(boundaries.len())
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
+    let buckets = queries::bucket_count(&boundaries);
     log::info!(
         "prepare: {} rows, {} buckets after thinning (asked for {}); {} bytes scanned",
         q.rows,

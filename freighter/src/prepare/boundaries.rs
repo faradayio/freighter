@@ -10,7 +10,7 @@ pub const MAX_BUCKETS: u32 = 4000;
 /// this makes a small source cost a partition walk per handful of rows:
 /// 1,000 rows over 1,000 partitions read in 27 s where one partition reads
 /// in a second. `--buckets` is a ceiling; the cut is thinned to this floor.
-pub const MIN_ROWS_PER_BUCKET: u64 = 50_000;
+pub(crate) const MIN_ROWS_PER_BUCKET: u64 = 50_000;
 
 /// The interior quantile cut points, deduplicated and ascending, thinned so
 /// that a bucket holds at least [`MIN_ROWS_PER_BUCKET`] of `rows`.
@@ -23,9 +23,10 @@ pub const MIN_ROWS_PER_BUCKET: u64 = 50_000;
 /// unions of consecutive quantile buckets, within one quantile bucket of
 /// equal size.
 ///
-/// Rounding is half-to-even (`round_ties_even`), Python's `round`: the
-/// reference implementation this ports picks the same cuts for the same input.
-pub fn shard_boundaries(cuts: &[String], lowest: &str, rows: u64) -> Vec<String> {
+/// Rounding is half-to-even (`round_ties_even`): a pick that falls exactly
+/// between two cuts takes the even position, so the same input always
+/// yields the same cuts.
+pub(crate) fn shard_boundaries(cuts: &[String], lowest: &str, rows: u64) -> Vec<String> {
     let interior: &[String] = cuts
         .get(1..cuts.len().saturating_sub(1))
         .unwrap_or_default();

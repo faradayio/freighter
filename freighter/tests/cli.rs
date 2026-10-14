@@ -97,8 +97,8 @@ fn validate_reads_a_file_uri_and_refuses_gs() {
 #[test]
 fn the_bare_uri_form_and_move_both_parse_and_fail_at_fetch() {
     // Both spellings reach the manifest fetch: the directory exists but the
-    // manifest does not, so the run fails at `store.get` and exits 2 the way
-    // v0.1 did. A clap usage error would also exit 2 but would not say
+    // manifest does not, so the run fails at `store.get` and exits 2 as the
+    // bare form always has. A clap usage error would also exit 2 but would not say
     // "fetch manifest".
     let dir = scratch_dir("bare");
     let uri = format!("file://{}", dir.join("manifest.json").display());

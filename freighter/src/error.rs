@@ -23,8 +23,8 @@ pub enum Error {
     /// uses). The client reports the code; retry policy lives in retry.rs.
     #[error("bigtable rpc {code}: {message}")]
     BigtableRpc { code: i32, message: String },
-    /// A BigQuery jobs-API call that failed after retries on the transport
-    /// or the token, or answered with something freighter cannot decode.
+    /// A BigQuery jobs-API call that failed for a reason other than a status:
+    /// transport, token, or a result freighter could not use.
     #[error("bq job: {0}")]
     BqJob(String),
     /// A BigQuery REST call answered with an error status: the HTTP code,
@@ -47,8 +47,8 @@ pub enum Error {
     /// line.
     #[error("{0}")]
     Refused(String),
-    /// `plan` rendered a manifest the mover's own validator refuses. That is
-    /// a bug in `plan`, not a user error, so it maps to exit 1.
+    /// `plan` could not render a manifest, or rendered one the mover's
+    /// validator refuses — a bug in `plan`, exit 1.
     #[error("plan: {0}")]
     Plan(String),
 }

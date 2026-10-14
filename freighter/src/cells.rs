@@ -7,6 +7,10 @@ use arrow_array::RecordBatch;
 use crate::error::{Error, Result};
 use crate::manifest::{CellCompression, MoveManifest};
 
+/// The source column holding the cell's value: read by the decoder, written
+/// by `prepare`, counted by `verify`.
+pub(crate) const JSON_COLUMN: &str = "json";
+
 /// The per-table config the manifest declares.
 #[derive(Debug, Clone)]
 pub struct TableConfig {

@@ -32,19 +32,36 @@ fn worker_threads() -> usize {
         .unwrap_or(1)
 }
 
+/// A command that failed: its exit code and the one line that reports it.
+/// `main` prints it; nothing else does.
+struct Fail(i32, String);
+
+impl From<Error> for Fail {
+    fn from(e: Error) -> Self {
+        Fail(exit_code(&e), e.to_string())
+    }
+}
+
+/// Exit 2: what the user fixes.
+fn refused(message: impl Into<String>) -> Fail {
+    Fail(2, message.into())
+}
+
 /// Splits "gs://bucket/a/b/manifest.json" into a store rooted at the
 /// prefix and the object name. file:// maps to a LocalFileSystem root for
 /// tests.
-fn store_for(uri: &str) -> Result<(Arc<dyn ObjectStore>, Path), String> {
+fn store_for(uri: &str) -> Result<(Arc<dyn ObjectStore>, Path), Fail> {
     if let Some(rest) = uri.strip_prefix("gs://") {
-        let (bucket, key) = rest.split_once('/').ok_or("gs uri needs bucket/key")?;
+        let (bucket, key) = rest
+            .split_once('/')
+            .ok_or_else(|| refused("gs uri needs bucket/key"))?;
         let (prefix, name) = key.rsplit_once('/').unwrap_or(("", key));
         // from_env, NOT new(): new() ignores GOOGLE_APPLICATION_CREDENTIALS,
         // which may be the pod's only credential path.
         let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket)
             .build()
-            .map_err(|e| format!("gcs store: {e}"))?;
+            .map_err(|e| refused(format!("gcs store: {e}")))?;
         let store: Arc<dyn ObjectStore> = if prefix.is_empty() {
             Arc::new(store)
         } else {
@@ -57,16 +74,18 @@ fn store_for(uri: &str) -> Result<(Arc<dyn ObjectStore>, Path), String> {
     } else if let Some(rest) = uri.strip_prefix("file://") {
         let dir = std::path::Path::new(rest)
             .parent()
-            .ok_or("file uri needs a parent dir")?;
+            .ok_or_else(|| refused("file uri needs a parent dir"))?;
         let name = std::path::Path::new(rest)
             .file_name()
             .and_then(|s| s.to_str())
-            .ok_or("file uri needs a file name")?;
+            .ok_or_else(|| refused("file uri needs a file name"))?;
         let store = object_store::local::LocalFileSystem::new_with_prefix(dir)
-            .map_err(|e| format!("local store: {e}"))?;
+            .map_err(|e| refused(format!("local store: {e}")))?;
         Ok((Arc::new(store), Path::from(name)))
     } else {
-        Err(format!("manifest uri {uri:?} must be gs:// or file://"))
+        Err(refused(format!(
+            "manifest uri {uri:?} must be gs:// or file://"
+        )))
     }
 }
 
@@ -82,44 +101,45 @@ fn exit_code(e: &Error) -> i32 {
 /// The manifest document from a URI, through the store rooted at its
 /// directory (verdicts land and are read there).
 ///
-/// Every failure here is 2, as in v0.1: a manifest that cannot be fetched is
-/// the caller's to fix, and a Job's restart policy should not retry it.
-async fn fetch_manifest(uri: &str) -> Result<(Arc<dyn ObjectStore>, MoveManifest), String> {
+/// Every failure here is 2: a manifest that cannot be fetched is the
+/// caller's to fix, and a Job's restart policy should not retry it.
+async fn fetch_manifest(uri: &str) -> Result<(Arc<dyn ObjectStore>, MoveManifest), Fail> {
     let (store, name) = store_for(uri)?;
     let doc = store
         .get(&name)
         .await
-        .map_err(|e| format!("fetch manifest {uri}: {e}"))?
+        .map_err(|e| refused(format!("fetch manifest {uri}: {e}")))?
         .bytes()
         .await
-        .map_err(|e| format!("read manifest {uri}: {e}"))?;
-    let text = std::str::from_utf8(&doc).map_err(|e| e.to_string())?;
-    let manifest = MoveManifest::from_json(text).map_err(|e| e.to_string())?;
+        .map_err(|e| refused(format!("read manifest {uri}: {e}")))?;
+    let text = std::str::from_utf8(&doc).map_err(|e| refused(e.to_string()))?;
+    let manifest = MoveManifest::from_json(text).map_err(|e| refused(e.to_string()))?;
     Ok((store, manifest))
 }
 
 /// `validate`'s document: stdin or a local file. No network, so gs:// is
 /// refused with the usage line.
-fn read_local(manifest: &str) -> Result<String, String> {
+fn read_local(manifest: &str) -> Result<String, Fail> {
     if manifest == "-" {
         let mut s = String::new();
         std::io::stdin()
             .read_to_string(&mut s)
-            .map_err(|e| format!("read stdin: {e}"))?;
+            .map_err(|e| refused(format!("read stdin: {e}")))?;
         return Ok(s);
     }
     let Some(path) = manifest.strip_prefix("file://") else {
-        return Err(format!(
+        return Err(refused(format!(
             "validate reads file:// or - (stdin), got {manifest:?}"
-        ));
+        )));
     };
-    std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))
+    std::fs::read_to_string(path).map_err(|e| refused(format!("read {path}: {e}")))
 }
 
-fn write_out(out: Option<&FsPath>, text: &str) -> Result<(), String> {
+/// Exit 1 on failure; `verify` makes it 2 with the rest of its failures.
+fn write_out(out: Option<&FsPath>, text: &str) -> Result<(), Fail> {
     match out {
         Some(path) => std::fs::write(path, format!("{text}\n"))
-            .map_err(|e| format!("write {}: {e}", path.display())),
+            .map_err(|e| Fail(1, format!("write {}: {e}", path.display()))),
         None => {
             println!("{text}");
             Ok(())
@@ -127,158 +147,73 @@ fn write_out(out: Option<&FsPath>, text: &str) -> Result<(), String> {
     }
 }
 
-async fn run_prepare(args: cli::PrepareArgs) -> i32 {
+async fn run_prepare(args: cli::PrepareArgs) -> Result<i32, Fail> {
     let out = args.out.clone();
-    let cfg = match args.into_config() {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("{e}");
-            return exit_code(&e);
-        }
-    };
+    let cfg = args.into_config()?;
     if let Some(out) = &out {
         if !out
             .parent()
             .is_none_or(|p| p.as_os_str().is_empty() || p.is_dir())
         {
-            log::error!("--out {}: its directory does not exist", out.display());
-            return 2;
+            return Err(refused(format!(
+                "--out {}: its directory does not exist",
+                out.display()
+            )));
         }
     }
-    let jobs = match BqJobs::connect().await {
-        Ok(j) => j,
-        Err(e) => {
-            log::error!("{e}");
-            return 1;
-        }
-    };
-    let record = match freighter::prepare::run(&jobs, &cfg).await {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("{e}");
-            return exit_code(&e);
-        }
-    };
-    let text = match record.to_json() {
-        Ok(t) => t,
-        Err(e) => {
-            log::error!("{e}");
-            return 1;
-        }
-    };
-    match write_out(out.as_deref(), &text) {
-        Ok(()) => 0,
-        Err(e) => {
-            log::error!("{e}");
-            // The record cost a full scan and a CTAS; a rerun refuses the built table, so never let a bad --out swallow it.
-            println!("{text}");
-            1
-        }
-    }
+    let jobs = BqJobs::connect().await?;
+    let record = freighter::prepare::run(&jobs, &cfg).await?;
+    let text = record.to_json().map_err(|e| Fail(1, e.to_string()))?;
+    write_out(out.as_deref(), &text).inspect_err(|_| {
+        // The record cost a full scan and a CTAS; a rerun refuses the built table, so never let a bad --out swallow it.
+        println!("{text}");
+    })?;
+    Ok(0)
 }
 
-fn run_plan(args: cli::PlanArgs) -> i32 {
+fn run_plan(args: cli::PlanArgs) -> Result<i32, Fail> {
     let source_path = args.source.clone();
     let out_dir = args.out_dir.clone();
     let cfg = args.into_config(SystemTime::now());
-    let source = match std::fs::read_to_string(&source_path)
-        .map_err(|e| Error::Refused(format!("read {}: {e}", source_path.display())))
-        .and_then(|t| SourceRecord::from_json(&t))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("{e}");
-            return exit_code(&e);
-        }
-    };
-    match freighter::plan::plan(&source, &cfg)
-        .and_then(|manifests| freighter::plan::write_manifests(&out_dir, &manifests))
-    {
-        Ok(paths) => {
-            for p in paths {
-                log::info!("wrote {}", p.display());
-            }
-            0
-        }
-        Err(e) => {
-            log::error!("{e}");
-            exit_code(&e)
-        }
+    let text = std::fs::read_to_string(&source_path)
+        .map_err(|e| Error::Refused(format!("read {}: {e}", source_path.display())))?;
+    let source = SourceRecord::from_json(&text)?;
+    let manifests = freighter::plan::plan(&source, &cfg)?;
+    for p in freighter::plan::write_manifests(&out_dir, &manifests)? {
+        log::info!("wrote {}", p.display());
     }
+    Ok(0)
 }
 
-async fn run_move(manifest_uri: &str) -> i32 {
-    let (store, manifest) = match fetch_manifest(manifest_uri).await {
-        Ok(x) => x,
-        Err(e) => {
-            log::error!("{e}");
-            return 2;
-        }
-    };
-    match freighter::pipeline::run_move(manifest, store).await {
-        Ok(()) => 0,
-        Err(e) => {
-            log::error!("move failed: {e}");
-            1
-        }
-    }
+async fn run_move(manifest_uri: &str) -> Result<i32, Fail> {
+    let (store, manifest) = fetch_manifest(manifest_uri).await?;
+    freighter::pipeline::run_move(manifest, store)
+        .await
+        .map_err(|e| Fail(1, format!("move failed: {e}")))?;
+    Ok(0)
 }
 
-async fn run_verify(args: cli::VerifyArgs) -> i32 {
-    let (store, manifest) = match fetch_manifest(&args.manifest_uri).await {
-        Ok(x) => x,
-        Err(e) => {
-            log::error!("{e}");
-            return 2;
-        }
-    };
+/// 0 when the verdicts match the source, 1 when they do not. Any failure
+/// is 2, set by the dispatch in `main`.
+async fn run_verify(args: cli::VerifyArgs) -> Result<i32, Fail> {
+    let (store, manifest) = fetch_manifest(&args.manifest_uri).await?;
     let billing_project = args
         .billing_project
         .unwrap_or_else(|| manifest.billing_project.clone());
-    let report = match BqJobs::connect().await {
-        Ok(jobs) => freighter::verify::run(&manifest, store, &jobs, &billing_project).await,
-        Err(e) => Err(e),
-    };
-    let report = match report {
-        Ok(r) => r,
-        Err(e) => {
-            log::error!("verify could not run: {e}");
-            return 2;
-        }
-    };
-    let text = match serde_json::to_string_pretty(&report) {
-        Ok(t) => t,
-        Err(e) => {
-            log::error!("report json: {e}");
-            return 2;
-        }
-    };
-    if let Err(e) = write_out(args.out.as_deref(), &text) {
-        log::error!("{e}");
-        return 2;
-    }
-    if report.ok {
-        0
-    } else {
-        1
-    }
+    let could_not_run = |e: Error| Fail(2, format!("verify could not run: {e}"));
+    let jobs = BqJobs::connect().await.map_err(could_not_run)?;
+    let report = freighter::verify::run(&manifest, store, &jobs, &billing_project)
+        .await
+        .map_err(could_not_run)?;
+    let text =
+        serde_json::to_string_pretty(&report).map_err(|e| Fail(2, format!("report json: {e}")))?;
+    write_out(args.out.as_deref(), &text)?;
+    Ok(if report.ok { 0 } else { 1 })
 }
 
-fn run_validate(manifest: &str) -> i32 {
-    let doc = match read_local(manifest) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
-        }
-    };
-    match MoveManifest::from_json(&doc) {
-        Ok(_) => 0,
-        Err(e) => {
-            eprintln!("{e}");
-            2
-        }
-    }
+fn run_validate(manifest: &str) -> Result<i32, Fail> {
+    MoveManifest::from_json(&read_local(manifest)?)?;
+    Ok(0)
 }
 
 fn main() {
@@ -294,13 +229,26 @@ fn main() {
         .build()
         .expect("tokio runtime");
     let code = rt.block_on(async {
-        match command {
+        let result = match command {
             cli::Command::Prepare(args) => run_prepare(args).await,
             cli::Command::Plan(args) => run_plan(args),
             cli::Command::Move { manifest_uri } => run_move(&manifest_uri).await,
-            cli::Command::Verify(args) => run_verify(args).await,
-            cli::Command::Validate { manifest } => run_validate(&manifest),
-        }
+            cli::Command::Verify(args) => run_verify(args)
+                .await
+                .map_err(|Fail(_, message)| Fail(2, message)),
+            cli::Command::Validate { manifest } => {
+                // validate's refusal is its whole output: bare on stderr,
+                // without the logger's prefix.
+                return run_validate(&manifest).unwrap_or_else(|Fail(code, message)| {
+                    eprintln!("{message}");
+                    code
+                });
+            }
+        };
+        result.unwrap_or_else(|Fail(code, message)| {
+            log::error!("{message}");
+            code
+        })
     });
     std::process::exit(code);
 }
@@ -313,7 +261,7 @@ mod tests {
     fn a_gs_manifest_uri_builds_a_store() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (_, name) = store_for("gs://bucket/loads/1/manifest.json")
-            .unwrap_or_else(|e| panic!("gs:// store: {e}"));
+            .unwrap_or_else(|f| panic!("gs:// store: {}", f.1));
         assert_eq!(name.as_ref(), "manifest.json");
     }
 }

@@ -19,7 +19,9 @@ use crate::client::{BtClient, RowWrite};
 use crate::error::{Error, Result};
 use crate::lanes::run_lanes;
 use crate::lookup::{decode_lookup, lookup_selected_fields};
-use crate::manifest::{MoveManifest, Outcome, ShardLabel, ShardRange, ShardSpec, ShardVerdict};
+use crate::manifest::{
+    verdict_file_name, MoveManifest, Outcome, ShardLabel, ShardRange, ShardSpec, ShardVerdict,
+};
 use crate::write::{collect_sorted, write_sorted, Counters, WriteRows};
 
 /// One stream's decode task: drains `rx`, decodes each RecordBatch into
@@ -431,7 +433,7 @@ pub async fn run_move(m: MoveManifest, store: Arc<dyn ObjectStore>) -> Result<()
 async fn upload_verdict(store: &Arc<dyn ObjectStore>, v: &ShardVerdict) -> Result<()> {
     // The store is rooted at the MANIFEST's location by main.rs, so
     // verdicts land beside the manifest.
-    let path = StorePath::from(format!("shard_{:04}.json", v.shard_index));
+    let path = StorePath::from(verdict_file_name(v.shard_index));
     let body = serde_json::to_vec(v).map_err(|e| Error::Storage(format!("verdict json: {e}")))?;
     store
         .put(&path, Bytes::from(body).into())

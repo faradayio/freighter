@@ -179,8 +179,16 @@ jq .cell_timestamp_micros load/manifest.json
 freighter plan ... --cell-timestamp-micros 1792003349318000 --out-dir load-rerun-1
 ```
 
-The value must be a whole number of milliseconds in microseconds, as in the
-manifest. See [Operating a load](operating.md#re-running-failed-shards).
+The value is microseconds since the epoch and a whole number of
+milliseconds, as in the manifest. Anything else is refused with exit 2 before
+a manifest is written. That includes a timestamp in seconds or milliseconds,
+which would stamp every cell in 1970:
+
+```
+error: invalid value '1792003349' for '--cell-timestamp-micros <CELL_TIMESTAMP_MICROS>': cell timestamp 1792003349 is not microseconds since the epoch (accepted: 2001-09-09 to 2286-11-20); seconds or milliseconds would stamp cells in 1970
+```
+
+See [Operating a load](operating.md#re-running-failed-shards).
 
 ## CPU
 

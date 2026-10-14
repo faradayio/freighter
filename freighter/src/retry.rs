@@ -5,6 +5,7 @@
 //! Names `tonic::Code` — a gRPC status enum, not a client/transport type;
 //! the swap boundary (README "Swap boundaries") stays: `bqread.rs` is still
 //! the only module naming BQ Storage Read / `tonic::transport` types.
+//! `retryable_http` classifies the BigQuery jobs API's HTTP statuses for `bqjobs.rs`.
 //!
 //! Why retry matters here: Google frontends close every connection at ~60
 //! min of age, and the first request dispatched on a dead channel fails
@@ -14,8 +15,6 @@
 
 use std::future::Future;
 use std::time::Duration;
-
-use crate::manifest::ShardLabel;
 
 /// Attempts per RPC (first try + retries) before the failure is real. The
 /// four backoffs between five attempts sum to ~7.5 s (0.5+1+2+4), plus
@@ -60,6 +59,14 @@ pub fn retryable_code(code: i32) -> bool {
     retryable(tonic::Code::from(code))
 }
 
+/// [`retryable`] for the BigQuery REST API: 5xx and 429 are transient, and
+/// so is a 403 whose error reason is `rateLimitExceeded` — BigQuery signals
+/// rate limits as either status. Plain integers and strings, so the policy
+/// lives here without naming an HTTP client.
+pub fn retryable_http(status: u16, reason: Option<&str>) -> bool {
+    status >= 500 || status == 429 || (status == 403 && reason == Some("rateLimitExceeded"))
+}
+
 /// 500 ms · 2^attempt, capped at 16 s: 0.5, 1, 2, 4, 8, 16, 16, …
 pub fn backoff(attempt: u32) -> Duration {
     const BASE_MS: u64 = 500;
@@ -81,7 +88,7 @@ pub fn backoff(attempt: u32) -> Duration {
 /// happened; the per-attempt `warn` lines below are the record of those.
 pub async fn retry_rpc<T, E, F, Fut>(
     what: &str,
-    label: ShardLabel,
+    label: impl std::fmt::Display,
     is_retryable: impl Fn(&E) -> bool,
     mut op: F,
 ) -> std::result::Result<(T, u64), E>
@@ -117,6 +124,7 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::manifest::ShardLabel;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn label() -> ShardLabel {
@@ -240,5 +248,34 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), RPC_ATTEMPTS);
         // backoff(0..=3) = 0.5+1+2+4s; paused clock makes this exact.
         assert_eq!(t0.elapsed(), Duration::from_millis(7500));
+    }
+
+    #[test]
+    fn retryable_http_covers_server_errors_and_both_rate_limit_spellings() {
+        for status in [500u16, 502, 503, 504, 429] {
+            assert!(retryable_http(status, None), "{status} must be retryable");
+        }
+        assert!(retryable_http(403, Some("rateLimitExceeded")));
+        assert!(!retryable_http(403, Some("accessDenied")));
+        assert!(!retryable_http(403, None));
+        for status in [400u16, 401, 404, 409, 200] {
+            assert!(
+                !retryable_http(status, None),
+                "{status} must NOT be retryable"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_rpc_accepts_any_display_label() {
+        let (v, retries) = retry_rpc(
+            "op",
+            "bq request_id=abc",
+            |_: &E| false,
+            |_| async { Ok::<_, E>(7) },
+        )
+        .await
+        .unwrap();
+        assert_eq!((v, retries), (7, 0));
     }
 }

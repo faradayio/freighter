@@ -5,7 +5,7 @@
 //! unit, a run of consecutive buckets. It never reads Bigtable: counting
 //! the destination is a full scan against live reads.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -20,8 +20,12 @@ pub const VERIFY_REPORT_VERSION: u32 = 1;
 
 /// The published result of `verify`. `ok` is "no problems and no strays";
 /// the exit code follows it.
+///
+/// Deliberately no `deny_unknown_fields`: this is an output, and a reader
+/// pinned to an older freighter must still parse a report that gained a
+/// field; `version` is the signal for a breaking change — the same rule as
+/// `ShardVerdict`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VerifyReport {
     pub version: u32,
     pub ok: bool,
@@ -34,14 +38,13 @@ pub struct VerifyReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Problem {
     pub shard: u32,
     pub reason: String,
 }
 
-/// One source bucket's rows: those whose json the mover sets as one cell,
-/// and those whose NULL json makes the mover delete the row.
+/// A source bucket's rows by what the mover does with them: sets (one cell
+/// each) and deletes (NULL json).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BucketRows {
     pub sets: u64,
@@ -77,7 +80,7 @@ pub fn count_sql(table: &TableRef, range_column: &str, lo: i64, hi: i64) -> Resu
 /// bucket, in manifest order; stray verdict indexes sorted.
 pub fn count_problems(
     shards: &[ShardSpec],
-    per_bucket: &HashMap<i64, BucketRows>,
+    per_bucket: &BTreeMap<i64, BucketRows>,
     verdicts: &[ShardVerdict],
 ) -> VerifyReport {
     let by_index: HashMap<u32, &ShardVerdict> =
@@ -85,8 +88,9 @@ pub fn count_problems(
     let mut problems = Vec::new();
     for shard in shards {
         let ShardRange::Int { lo, hi } = shard.range;
-        let (expected_sets, expected_deletes) = (lo..=hi)
-            .map(|b| per_bucket.get(&b).copied().unwrap_or_default())
+        let (expected_sets, expected_deletes) = per_bucket
+            .range(lo..=hi)
+            .map(|(_, b)| *b)
             .fold((0u64, 0u64), |(s, d), b| (s + b.sets, d + b.deletes));
         let mut problem = |reason: String| {
             problems.push(Problem {
@@ -139,16 +143,12 @@ pub fn count_problems(
     }
 }
 
-/// Reads the verdicts beside the manifest (the store is rooted at the
-/// manifest's directory by `main`; the listing is non-recursive so a
-/// `file://` manifest in `/tmp` never walks `/tmp` and a ramp's `step-N/`
-/// directories are never swept in), runs one count, and judges.
-pub async fn run(
-    m: &MoveManifest,
-    store: Arc<dyn ObjectStore>,
-    jobs: &BqJobs,
-    billing_project: &str,
-) -> Result<VerifyReport> {
+/// The verdicts directly in the store's root (rooted at the manifest's
+/// directory by `main`), sorted by shard index. The listing is
+/// non-recursive so a `file://` manifest in `/tmp` never walks `/tmp` and a
+/// ramp's `step-N/` directories are never swept in; only names
+/// `verdict_index` accepts are read.
+pub(crate) async fn read_verdicts(store: &Arc<dyn ObjectStore>) -> Result<Vec<ShardVerdict>> {
     let listing = store
         .list_with_delimiter(None)
         .await
@@ -158,9 +158,9 @@ pub async fn run(
         let Some(name) = meta.location.filename() else {
             continue;
         };
-        if verdict_index(name).is_none() {
+        let Some(index) = verdict_index(name) else {
             continue;
-        }
+        };
         let bytes = store
             .get(&meta.location)
             .await
@@ -168,10 +168,32 @@ pub async fn run(
             .bytes()
             .await
             .map_err(|e| Error::Storage(format!("read {}: {e}", meta.location)))?;
+        // Fail closed: a verdict that cannot be read is a directory the fence must not judge.
         let v: ShardVerdict = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Storage(format!("verdict {}: {e}", meta.location)))?;
+        if v.shard_index != index {
+            return Err(Error::Storage(format!(
+                "{name} holds shard_index {}: the file name and its content disagree",
+                v.shard_index
+            )));
+        }
         verdicts.push(v);
     }
+    verdicts.sort_by_key(|v| v.shard_index);
+    Ok(verdicts)
+}
+
+/// Reads the verdicts beside the manifest, runs one count, and judges.
+/// The count spans `[min lo, max hi]` of the manifest's shards, so a sparse
+/// manifest scans the gaps too; a ramp step's contiguous sub-range costs
+/// exactly its buckets.
+pub async fn run(
+    m: &MoveManifest,
+    store: Arc<dyn ObjectStore>,
+    jobs: &BqJobs,
+    billing_project: &str,
+) -> Result<VerifyReport> {
+    let verdicts = read_verdicts(&store).await?;
     let table = TableRef::from_path(&m.source_table)
         .map_err(|e| Error::Manifest(format!("source_table: {e}")))?;
     let (lo, hi) = m.shards.iter().fold((i64::MAX, i64::MIN), |(lo, hi), s| {
@@ -180,7 +202,7 @@ pub async fn run(
     });
     let sql = count_sql(&table, &m.range_column, lo, hi)?;
     let counted = jobs.query(billing_project, &sql).await?;
-    let mut per_bucket = HashMap::with_capacity(counted.rows.len());
+    let mut per_bucket = BTreeMap::new();
     for row in &counted.rows {
         let bucket = row.i64(0)?;
         let sets = u64::try_from(row.i64(1)?)
@@ -257,8 +279,8 @@ mod tests {
         ]
     }
 
-    fn per_bucket() -> HashMap<i64, BucketRows> {
-        HashMap::from([
+    fn per_bucket() -> BTreeMap<i64, BucketRows> {
+        BTreeMap::from([
             (
                 10,
                 BucketRows {
@@ -389,5 +411,48 @@ mod tests {
         assert!(sql.contains("WHERE `bucket` BETWEEN 0 AND 53"));
         assert!(sql.contains("GROUP BY bucket"));
         assert!(count_sql(&t, "b`ucket", 0, 1).is_err());
+        assert!(count_sql(&t, "", 0, 1).is_err());
+    }
+
+    #[test]
+    fn a_shard_spanning_the_whole_i64_range_is_judged_promptly() {
+        let whole = [ShardSpec {
+            index: 0,
+            range: ShardRange::Int {
+                lo: i64::MIN,
+                hi: i64::MAX,
+            },
+            expect_empty: false,
+            lane: 0,
+        }];
+        let report = count_problems(&whole, &per_bucket(), &[complete(0, 220, 3)]);
+        assert!(report.ok, "{:?}", report.problems);
+    }
+
+    #[tokio::test]
+    async fn read_verdicts_takes_only_the_directory_s_own_shard_files() {
+        let dir = std::env::temp_dir().join(format!("freighter-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("step-0")).unwrap();
+        let fixture = include_str!("../fixtures/freighter-verdict-example.json");
+        std::fs::write(dir.join("shard_0000.json"), fixture).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("step-0/shard_0001.json"),
+            fixture.replace("\"shard_index\": 0", "\"shard_index\": 1"),
+        )
+        .unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let verdicts = read_verdicts(&store).await.unwrap();
+        assert_eq!(
+            verdicts.iter().map(|v| v.shard_index).collect::<Vec<_>>(),
+            [0],
+            "nested and non-verdict files are ignored"
+        );
+        std::fs::write(dir.join("shard_0007.json"), fixture).unwrap(); // content says 0, name says 7
+        let err = read_verdicts(&store).await.unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
